@@ -108,7 +108,7 @@ def is_suppressed(key: str) -> bool:
         return key in _suppressed
 
 
-def clear():
+def clear_all():
     """Teardown — wipe all state."""
     with _lock:
         _store.clear()
@@ -117,3 +117,7 @@ def clear():
         _customers.clear()
         _triggers.clear()
         _suppressed.clear()
+
+
+# Alias for backward compatibility
+clear = clear_all

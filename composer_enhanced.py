@@ -736,16 +736,29 @@ def compose(
 
 
 def _fallback_response(trigger_kind: str, facts: dict, merchant: dict) -> Dict[str, Any]:
-    """Fallback when LLM fails — still provide a sensible message."""
+    """Fallback when LLM fails — still provide a sensible, specific message."""
     owner = merchant.get("identity", {}).get("owner_first_name", "there")
     merchant_name = merchant.get("identity", {}).get("name", "your business")
+    city = merchant.get("identity", {}).get("city", "your area")
+    
+    # Extract some specifics from facts to make fallback less generic
+    ctr = facts.get("ctr_pct", 0)
+    calls = facts.get("calls_this_week", 0)
+    active_offers = facts.get("active_offers", [])
+    offer_str = ""
+    if active_offers and len(active_offers) > 0:
+        first_offer = active_offers[0]
+        offer_str = f" Our {first_offer.get('offer_type', 'promotion')} is live."
     
     fallbacks = {
-        "research_digest": f"Hi {owner}, found something relevant to {merchant_name}. Want me to share ideas?",
-        "perf_dip": f"Hi {owner}, noticed a small dip this week. Want to discuss what might help?",
-        "perf_spike": f"Congrats {owner}! Your momentum is strong. Want to capitalize on it?",
-        "recall_due": f"Quick reminder from {merchant_name} — good time for your next visit.",
-        "generic": f"Hi {owner}, quick thought about {merchant_name}. Got 30 seconds?"
+        "research_digest": f"Hi {owner}, found {city} insights for {merchant_name}.{offer_str} Want ideas?",
+        "perf_dip": f"Hi {owner}, saw {calls} calls this week at {merchant_name}. Quick call — can help spike it?",
+        "perf_spike": f"Congrats {owner}! {merchant_name} is trending up (CTR: {ctr}%).{offer_str} Let's lock gains.",
+        "recall_due": f"{owner}, great time for customer recalls at {merchant_name}.{offer_str} Shall I draft?",
+        "festival_upcoming": f"Hi {owner}, {city} is festive season! {merchant_name} ready?{offer_str}",
+        "renewal_due": f"Hi {owner}, renewals due at {merchant_name}.{offer_str} Quick strategy chat?",
+        "competitor_opened": f"{owner}, heads up: competitor opened in {city}. Let's keep {merchant_name} strong.{offer_str}",
+        "generic": f"Hi {owner}, thought for {merchant_name}. {ctr}% CTR, {calls} calls. Got 30 sec?{offer_str}"
     }
     
     return {
@@ -753,7 +766,7 @@ def _fallback_response(trigger_kind: str, facts: dict, merchant: dict) -> Dict[s
         "cta": "open_ended",
         "send_as": "vera",
         "suppression_key": f"{trigger_kind}:{merchant.get('merchant_id')}",
-        "rationale": f"Fallback for {trigger_kind}"
+        "rationale": f"Fallback for {trigger_kind} (LLM unavailable)"
     }
 
 

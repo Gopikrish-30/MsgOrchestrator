@@ -165,6 +165,8 @@ def _detect_auto_reply(body: str, conv: dict) -> bool:
     1. Exact repeat of previous message
     2. Keyword match (confidence weighted)
     3. Generic thank-you pattern (low value add)
+    
+    NOTE: Check action intent BEFORE Signal 3 to avoid false positives like "Thanks, go ahead!"
     """
     lower = body.lower().strip()
     
@@ -181,6 +183,16 @@ def _detect_auto_reply(body: str, conv: dict) -> bool:
     
     if max_conf >= 0.85:  # High confidence threshold
         return True
+    
+    # PRE-CHECK Signal 3: if merchant has action intent, NOT auto-reply (even if thanks)
+    has_action_intent = False
+    for pattern, conf in _ACTION_INTENT_PATTERNS.items():
+        if re.search(pattern, lower, re.IGNORECASE) and conf >= 0.85:
+            has_action_intent = True
+            break
+    
+    if has_action_intent:
+        return False  # Action intent overrides generic thanks
     
     # Signal 3: generic thank-you without substance
     generic_thanks = [

@@ -291,6 +291,21 @@ async def tick(body: TickBody):
             )
             continue
 
+        # Check unanswered_count — if 3+ unanswered, send graceful exit and skip
+        conv = conversation.get_or_create(conv_id, merchant_id=merchant_id, trigger_id=trg_id)
+        if conv.get("unanswered_count", 0) >= 3:
+            # Graceful exit after 3 ignored messages
+            SUPPRESSED_CONVOS.add(conv_id)
+            exit_msg = conversation.graceful_exit_message(
+                merchant.get("identity", {}).get("owner_first_name", "there"), False
+            )
+            conversation.record_bot_turn(conv_id, exit_msg)
+            logger.info(f"Graceful exit after 3 unanswered: {conv_id}")
+            sup_key = trigger.get("suppression_key", "")
+            if sup_key:
+                context_store.suppress(sup_key)
+            continue
+
         # Compose message
         try:
             result = compose(
@@ -316,7 +331,6 @@ async def tick(body: TickBody):
             context_store.suppress(sup_key)
 
         # Record bot turn in conversation state
-        conversation.get_or_create(conv_id, merchant_id=merchant_id, trigger_id=trg_id)
         conversation.record_bot_turn(conv_id, body_text)
 
         # Save conversation metadata for /reply lookups
@@ -481,6 +495,50 @@ async def reply(body: ReplyBody):
                     return response
         except Exception as e:
             logger.error(f"Execution mode compose error: {e}", exc_info=True)
+
+    # If question intent, answer briefly with context available
+    if analysis["intent"] == "question":
+        merchant_obj = context_store.get_merchant(merchant_id) or {}
+        owner = merchant_obj.get("identity", {}).get("owner_first_name", "there")
+        merchant_name = merchant_obj.get("identity", {}).get("name", "your business")
+        
+        # Extract some context from facts to answer better
+        ctr = merchant_obj.get("ctr_pct", 0)
+        calls = merchant_obj.get("calls_this_week", 0)
+        offers = merchant_obj.get("active_offers", [])
+        offer_mention = f" We have {len(offers)} active offers running." if offers else ""
+        
+        # Generic but contextual answer
+        answer = f"Sure! {merchant_name} is seeing {calls} calls this week, {ctr}% CTR.{offer_mention} Anything specific?"
+        conversation.record_bot_turn(conv_id, answer)
+        response = {
+            "action": "send",
+            "body": answer,
+            "cta": "open_ended",
+            "rationale": "Answered merchant's question with available facts.",
+            "conversation_state": "active",
+            "suppression_key": f"question_reply:{conv_id}",
+        }
+        logger.info(f"Question reply: {conv_id}")
+        return response
+
+    # If offtopic, polite redirect
+    if analysis["intent"] == "offtopic":
+        merchant_obj = context_store.get_merchant(merchant_id) or {}
+        merchant_name = merchant_obj.get("identity", {}).get("name", "your business")
+        
+        redirect = f"That's outside my wheelhouse, but I'm here for {merchant_name} growth. Any concerns about your current performance or offers?"
+        conversation.record_bot_turn(conv_id, redirect)
+        response = {
+            "action": "send",
+            "body": redirect,
+            "cta": "open_ended",
+            "rationale": "Polite redirect from off-topic query.",
+            "conversation_state": "active",
+            "suppression_key": f"offtopic_redirect:{conv_id}",
+        }
+        logger.info(f"Off-topic redirect: {conv_id}")
+        return response
 
     # Default: acknowledgment + keep conversation alive
     response = {
