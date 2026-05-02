@@ -67,20 +67,6 @@ pip install -r requirements.txt
 uvicorn main_enhanced:app --host 0.0.0.0 --port 8080
 ```
 
-## How To Add Team Details
-
-Edit `.env` and set these fields:
-
-```env
-TEAM_NAME=Your Team Name
-TEAM_MEMBERS=Member One,Member Two
-CONTACT_EMAIL=your@email.com
-GITHUB_REPO=https://github.com/your-org/your-repo
-SUBMITTED_AT=2026-05-02T23:00:00Z
-GROQ_MODEL=llama-3.1-8b-instant
-```
-
-These values are returned by `GET /v1/metadata`, so they are the main place to customize your submission identity.
 
 ## End-to-End Flow
 
