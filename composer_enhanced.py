@@ -1,0 +1,711 @@
+"""
+composer_enhanced.py — The heart of the winning bot.
+
+Composes high-compulsion WhatsApp messages from 4 context layers.
+Uses Groq (meta-llama/llama-4-scout-17b-16e-instruct) as the LLM backbone.
+
+CORE PHILOSOPHY:
+- Dispatch by trigger.kind for maximum relevance (25+ kinds handled specifically)
+- Extract specifics FIRST, then instruct LLM to use only what's given
+- Enforce category voice, taboos, allowed vocabulary
+- Single clear CTA per message
+- NO hallucinations, NO invented facts
+- Temperature=0 for determinism
+
+SCORING TARGETS:
+  1. Decision Quality — trigger fit + merchant state + category fit
+  2. Specificity — real numbers, offers, dates (extracted, never invented)
+  3. Category Fit — clinical/visual/timely/utility voices true to vertical
+  4. Merchant Fit — personalized to metrics, offers, history
+  5. Engagement Compulsion — 2-3 levers (proof, urgency, curiosity, effort-external)
+"""
+import os
+import json
+import re
+import logging
+from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+
+from groq import Groq
+
+logger = logging.getLogger(__name__)
+
+# ── Groq client ───────────────────────────────────────────────────────────
+_client: Optional[Groq] = None
+
+def _normalize_groq_base_url(raw: str) -> str:
+    """Accept either root URL or OpenAI-style path and normalize for Groq SDK."""
+    base = (raw or "").strip().rstrip("/")
+    if base.endswith("/openai/v1"):
+        base = base[: -len("/openai/v1")]
+    return base
+
+
+def _get_client() -> Groq:
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY", "")
+        base_url = _normalize_groq_base_url(os.getenv("GROQ_BASE_URL", ""))
+        if base_url:
+            _client = Groq(api_key=api_key, base_url=base_url, max_retries=0)
+        else:
+            _client = Groq(api_key=api_key, max_retries=0)
+    return _client
+
+MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+
+# ── Category voice profiles ────────────────────────────────────────────────
+CATEGORY_VOICES = {
+    "dentists": {
+        "voice": "peer-clinical",
+        "tone": "professional, knowledgeable, peer-advisor tone",
+        "allowed_vocab": [
+            "fluoride", "recall", "prophylaxis", "restoration", "alignment",
+            "cavity", "plaque", "extraction", "composite", "enamel", "dentin",
+            "anterior", "posterior", "occlusion", "bite", "referral"
+        ],
+        "taboos": [
+            "cure", "guaranteed", "always works", "pain-free", "permanent",
+            "perfect", "lifetime", "never fail", "miracle", "proven 100%"
+        ],
+        "greeting": "Dr. {owner}, {message}",
+        "proof_style": "peer + trial data + source citation",
+        "seasonal": ["exam-stress bruxism Nov-Feb", "wedding whitening Oct-Dec"]
+    },
+    "salons": {
+        "voice": "warm-practical",
+        "tone": "friendly, enthusiastic, fellow-operator, accessible",
+        "allowed_vocab": [
+            "style", "cut", "color", "service", "client", "booking", "look",
+            "trend", "season", "package", "care", "glow", "shine"
+        ],
+        "taboos": [
+            "scientific", "clinical", "guaranteed", "perfect", "forever",
+            "never fades", "permanent", "100% satisfaction"
+        ],
+        "greeting": "Hi {owner}, {message}",
+        "proof_style": "customer love + bookings + word-of-mouth signals",
+        "seasonal": ["summer lightening", "wedding season Oct-Feb"]
+    },
+    "restaurants": {
+        "voice": "fellow-operator",
+        "tone": "peer-to-peer, pragmatic, growth-minded, street-smart",
+        "allowed_vocab": [
+            "covers", "order", "delivery", "dine-in", "table", "menu", "cuisine",
+            "rush", "off-peak", "capacity", "seating", "footfall", "check average"
+        ],
+        "taboos": [
+            "guaranteed", "always full", "never empty", "permanent boost",
+            "forever busy", "never slow"
+        ],
+        "greeting": "{owner}, quick thought — {message}",
+        "proof_style": "local market data + footfall + order trends",
+        "seasonal": ["festival surges", "wedding season bookings", "summer dining"]
+    },
+    "gyms": {
+        "voice": "energetic-coach",
+        "tone": "motivational, action-focused, member-centric, growth-oriented",
+        "allowed_vocab": [
+            "strength", "cardio", "membership", "goals", "results", "commitment",
+            "progress", "transformation", "routine", "session", "class", "coach"
+        ],
+        "taboos": [
+            "guaranteed", "instant results", "no effort", "transform in days",
+            "forever fit", "never quit", "always motivated"
+        ],
+        "greeting": "Hey {owner}, thought of you — {message}",
+        "proof_style": "member testimonials + retention + referral trends",
+        "seasonal": ["New Year resolutions Jan-Feb", "summer beach body May-Aug"]
+    },
+    "pharmacies": {
+        "voice": "trustworthy-precise",
+        "tone": "precise, safety-first, knowledgeable, helpful, regulatory-aware",
+        "allowed_vocab": [
+            "medication", "prescription", "dosage", "refill", "side-effect",
+            "contraindication", "generic", "branded", "safety", "compliance",
+            "inventory", "batch", "expiry"
+        ],
+        "taboos": [
+            "cure", "guaranteed", "works for everyone", "no side effects",
+            "better than", "safest", "always safe", "recommended by all"
+        ],
+        "greeting": "Hi {owner}, {message}",
+        "proof_style": "regulatory + medication safety data + patient care",
+        "seasonal": ["seasonal cough/cold Sep-Feb", "allergy season Mar-Jun"]
+    }
+}
+
+
+# ── Language instruction ───────────────────────────────────────────────────
+def _get_language_instruction(merchant: dict, customer: dict = None) -> str:
+    """Detect language preference and return LLM instruction."""
+    target = customer or merchant
+    pref = (target.get("identity") or {}).get("language_pref", "")
+    langs = (target.get("identity") or {}).get("languages", []) or []
+    
+    if not pref:
+        pref = (merchant.get("identity") or {}).get("languages", []) or []
+
+    # Map to language code
+    if isinstance(pref, str):
+        pref = [pref]
+
+    if any("hi" in l.lower() for l in pref):
+        return "Use Hindi-English code-mix (Hinglish). Natural blend: Hindi sentence structure with English technical/offer words. NOT formal Hindi, NOT pure English. Examples: 'aapka ctr 2% se zyada chal gaya,' 'discount ke saath booking ke liye 2 slots ready hain.'"
+    elif any("te" in l.lower() for l in pref):
+        return "Use Telugu-English mix. Primarily English with occasional Telugu warmth. Example: 'Inka ee week lo patients ni book cheyali.'"
+    elif any("ta" in l.lower() for l in pref):
+        return "Use Tamil-English mix. Primarily English with Tamil warmth."
+    elif any("mr" in l.lower() for l in pref):
+        return "Use Marathi-English mix naturally."
+    else:
+        return "Use English only."
+
+
+# ── Specificity extraction ─────────────────────────────────────────────────
+def _extract_specifics(category: dict, merchant: dict, trigger: dict,
+                        customer: dict = None) -> Dict[str, Any]:
+    """
+    Extract ONLY concrete facts from contexts.
+    LLM will be instructed to use ONLY these numbers, never invent any.
+    Returns a dict with clean, indexed facts.
+    """
+    facts = {}
+
+    # Merchant identity
+    identity = merchant.get("identity", {})
+    facts["merchant_name"] = identity.get("name", "")
+    facts["owner_name"] = identity.get("owner_first_name", "")
+    facts["city"] = identity.get("city", "")
+    facts["locality"] = identity.get("locality", "")
+    facts["verified"] = identity.get("verified", False)
+    
+    # Subscription
+    sub = merchant.get("subscription", {})
+    facts["subscription_status"] = sub.get("status", "")
+    facts["subscription_plan"] = sub.get("plan", "")
+    facts["days_remaining"] = sub.get("days_remaining", 0)
+
+    # Performance (raw numbers, no comparisons)
+    perf = merchant.get("performance", {})
+    if perf:
+        facts["window_days"] = perf.get("window_days", 30)
+        facts["views_30d"] = perf.get("views", 0)
+        facts["calls_30d"] = perf.get("calls", 0)
+        facts["directions_30d"] = perf.get("directions", 0)
+        facts["ctr_30d"] = perf.get("ctr", 0)
+        facts["leads_30d"] = perf.get("leads", 0)
+        
+        # 7-day deltas (in percentage terms, raw)
+        delta = perf.get("delta_7d", {})
+        if delta:
+            facts["views_delta_7d_pct"] = delta.get("views_pct", 0)
+            facts["calls_delta_7d_pct"] = delta.get("calls_pct", 0)
+            facts["ctr_delta_7d_pct"] = delta.get("ctr_pct", 0)
+
+    # Peer benchmarks (for comparison context only)
+    peer = category.get("peer_stats", {})
+    if peer:
+        facts["peer_avg_ctr"] = peer.get("avg_ctr", 0)
+        facts["peer_avg_views_30d"] = peer.get("avg_views_30d", 0)
+        facts["peer_avg_calls_30d"] = peer.get("avg_calls_30d", 0)
+        facts["peer_avg_rating"] = peer.get("avg_rating", 0)
+        facts["peer_avg_review_count"] = peer.get("avg_review_count", 0)
+        facts["peer_scope"] = peer.get("scope", "")
+
+    # Offers (exact titles, statuses)
+    offers_active = []
+    offers_expired = []
+    for o in merchant.get("offers", []):
+        if o.get("status") == "active":
+            offers_active.append({
+                "title": o.get("title", ""),
+                "id": o.get("id", ""),
+                "started": o.get("started", "")
+            })
+        elif o.get("status") == "expired":
+            offers_expired.append({
+                "title": o.get("title", ""),
+                "id": o.get("id", ""),
+                "ended": o.get("ended", "")
+            })
+    facts["active_offers"] = offers_active
+    facts["expired_offers"] = offers_expired
+
+    # Signals (as given, no inference)
+    facts["signals"] = merchant.get("signals", [])
+
+    # Customer aggregate
+    cagg = merchant.get("customer_aggregate", {})
+    facts["customer_aggregate"] = cagg
+
+    # Review themes (top 3)
+    reviews = merchant.get("review_themes", [])
+    facts["review_themes"] = reviews[:3]
+
+    # Conversation history (last 2 turns)
+    hist = merchant.get("conversation_history", [])
+    facts["last_conversation"] = hist[-2:] if hist else []
+
+    # Trigger info
+    facts["trigger_kind"] = trigger.get("kind", "")
+    facts["trigger_urgency"] = trigger.get("urgency", 0)
+    facts["trigger_source"] = trigger.get("source", "")
+    facts["trigger_scope"] = trigger.get("scope", "merchant")
+    facts["trigger_payload"] = trigger.get("payload", {})
+
+    # Category info
+    facts["category_slug"] = category.get("slug", "")
+    facts["category_offer_catalog"] = [
+        {"title": o.get("title", ""), "id": o.get("id", "")} 
+        for o in category.get("offer_catalog", [])[:5]
+    ]
+    facts["category_digest"] = category.get("digest", [])[:3]  # top 3 digest items
+    facts["category_voice_profile"] = CATEGORY_VOICES.get(
+        category.get("slug", ""), {}
+    )
+
+    # Customer info (if present)
+    if customer:
+        c_identity = customer.get("identity", {})
+        facts["customer_name"] = c_identity.get("name", "")
+        facts["customer_language_pref"] = c_identity.get("language_pref", "")
+        c_rel = customer.get("relationship", {})
+        facts["customer_relationship"] = {
+            "first_visit": c_rel.get("first_visit", ""),
+            "last_visit": c_rel.get("last_visit", ""),
+            "visits_total": c_rel.get("visits_total", 0),
+            "services_received": c_rel.get("services_received", [])
+        }
+        facts["customer_preferences"] = customer.get("preferences", {})
+        facts["customer_consent_scope"] = customer.get("consent", {}).get("scope", [])
+        facts["customer_state"] = customer.get("state", "")
+
+    return facts
+
+
+# ── Trigger-specific composition strategies ────────────────────────────────
+def _build_trigger_instruction(trigger_kind: str, facts: Dict[str, Any],
+                               category_slug: str) -> str:
+    """
+    Build a trigger-kind-specific system instruction.
+    These tell the LLM exactly what to do for each trigger type.
+    """
+    
+    merchant_name = facts.get("merchant_name", "")
+    owner_name = facts.get("owner_name", "")
+    voice_profile = facts.get("category_voice_profile", {})
+    voice_name = voice_profile.get("voice", "professional")
+    allowed_vocab = voice_profile.get("allowed_vocab", [])
+    taboos = voice_profile.get("taboos", [])
+    proof_style = voice_profile.get("proof_style", "")
+
+    base_instruction = f"""
+You are composing a WhatsApp message for {merchant_name} (owner: {owner_name}).
+Category: {category_slug} — use {voice_name} voice ({voice_profile.get('tone', '')}).
+
+CRITICAL CONSTRAINTS:
+1. Use ONLY the facts provided. NEVER invent numbers, offers, dates, or customer names.
+2. Allowed vocabulary: {', '.join(allowed_vocab[:8])}.
+3. TABOOS (absolutely avoid): {', '.join(taboos)}.
+4. Single clear CTA only. No multiple options unless explicitly stated.
+5. Keep message ≤160 chars for WhatsApp single-SMS click-through.
+6. Personalize with owner name or merchant name naturally.
+7. Proof style for this vertical: {proof_style}.
+
+MESSAGE TONE RULES:
+- {voice_profile.get('greeting', 'Hi merchant, message')}
+- No emojis unless Hinglish/local context demands it.
+- No punctuation overkill (no !!!, ???, ...).
+"""
+    
+    if trigger_kind == "research_digest":
+        return base_instruction + """
+TRIGGER: Research digest.
+STRATEGY:
+- Hook: Name the finding, source, trial size/year, key stat in FIRST sentence.
+- Anchor: Connect to THIS merchant's specific patient cohort or offers.
+- CTA: Curiosity-driven, open-ended. "Want me to draft a patient message + ideas?" — not a yes/no.
+- Proof: Source + citation + actionable summary.
+"""
+    
+    elif trigger_kind == "regulation_change":
+        return base_instruction + """
+TRIGGER: Compliance alert.
+STRATEGY:
+- Hook: Name regulation + issuing body + DEADLINE (e.g., "DCI revised radiograph dose limits by Dec 15").
+- Urgency: Loss aversion framing. "Before audit cycle" or "Before deadline."
+- CTA: Binary. "Reply YES to get the updated SOP checklist" or "Want the compliance brief?"
+- Tone: Serious, peer advisor, factual.
+"""
+    
+    elif trigger_kind in ["recall_due", "chronic_refill_due"]:
+        # Customer-scoped trigger
+        customer_name = facts.get("customer_name", "")
+        return base_instruction + f"""
+TRIGGER: Patient/customer recall or refill due.
+CUSTOMER: {customer_name}
+STRATEGY:
+- Greeting: Merchant-on-behalf. Use merchant name, NOT Vera name.
+- Personalization: {customer_name}'s first name, specific service, months since last visit.
+- Slots: Offer 2-3 specific appointment slots from the payload (e.g., "Wed 2pm or Thu 4pm").
+- Price: Include exact service price + any bonus from catalog.
+- CTA: Multi-choice slot selection is OK here ("Reply 1 for Wed, 2 for Thu").
+- Language: Match customer's language preference exactly.
+"""
+    
+    elif trigger_kind == "perf_dip":
+        views_delta = facts.get("views_delta_7d_pct", 0) * 100
+        calls_delta = facts.get("calls_delta_7d_pct", 0) * 100
+        return base_instruction + f"""
+TRIGGER: Performance dip alert.
+FACTS: Views {calls_delta:+.0f}%, Calls {views_delta:+.0f}% week-over-week.
+STRATEGY:
+- Hook: Name exact metric and delta. "Your calls dropped {abs(calls_delta):.0f}% week-over-week" — not vague.
+- Hypothesis: Offer likely reason (no active offer, stale posts, seasonal dip).
+- Solution: ONE specific action Vera can take right now.
+- CTA: Binary. "Want me to activate [offer] + update your GBP post today? Reply YES/STOP."
+- Loss aversion: Frame what's being lost in concrete terms (e.g., "that's ~X missed calls/week").
+"""
+    
+    elif trigger_kind == "perf_spike":
+        views_delta = facts.get("views_delta_7d_pct", 0) * 100
+        calls_delta = facts.get("calls_delta_7d_pct", 0) * 100
+        return base_instruction + f"""
+TRIGGER: Performance spike — capitalize on momentum.
+FACTS: Views {views_delta:+.0f}%, Calls {calls_delta:+.0f}% — you're hot! 🔥
+STRATEGY:
+- Hook: Name metric, delta, and likely driver. "Your calls spiked {calls_delta:+.0f}% — looks like [reason]."
+- Momentum: Frame as immediate opportunity. "When you're hot, strike."
+- Suggest: ONE specific action to amplify (new post, activate offer, respond to reviews).
+- CTA: Binary. "Reply YES to do it in the next 2 hours while momentum lasts."
+"""
+    
+    elif trigger_kind == "competitor_opened":
+        payload = facts.get("trigger_payload", {})
+        distance = payload.get("distance_km", "nearby")
+        return base_instruction + f"""
+TRIGGER: Competitor opened nearby.
+FACTS: {distance} away on Google.
+STRATEGY:
+- Hook: Data-driven, non-alarmist. "New clinic {distance} away on GBP — 3 reviews already."
+- Angle: Differentiation, not panic. "Your strengths: [pick 1-2 from reviews]."
+- CTA: Actionable counter-move. "Want to run a limited offer to show your vibe?" or "Let me highlight your reviews vs theirs?"
+- Tone: Pragmatic peer, not fearful.
+"""
+    
+    elif trigger_kind == "supply_alert":
+        payload = facts.get("trigger_payload", {})
+        item = payload.get("item_name", "key item")
+        return base_instruction + f"""
+TRIGGER: Supply/inventory alert.
+ITEM: {item}
+STRATEGY:
+- Hook: Urgency + batch numbers. "{item} stock dipping — batch #XYZ runs out in 3 days."
+- CTA: Executable workflow. "Reply YES and I'll draft a supplier outreach + customer prep message."
+- Tone: Logistics-savvy peer, helpful.
+"""
+    
+    elif trigger_kind == "active_planning_intent":
+        return base_instruction + """
+TRIGGER: Merchant explicitly said "yes, let's do it."
+STRATEGY:
+- NO re-qualification. Merchant already decided.
+- Move to EXECUTION mode. Next message should be: "Great! Here's what I'll do [concrete steps]. You just [simple review step]."
+- CTA: Confirmation only. "I'll start now — anything else?"
+"""
+    
+    elif trigger_kind == "seasonal_window":
+        payload = facts.get("trigger_payload", {})
+        season = payload.get("season_name", "upcoming season")
+        return base_instruction + f"""
+TRIGGER: Seasonal opportunity window.
+SEASON: {season}
+STRATEGY:
+- Hook: Category-specific seasonal moment + data (e.g., "wedding season — your category sees 40% more booking intent").
+- Idea: 1-2 seasonal offer ideas from category digest or catalog.
+- CTA: "Want me to draft a seasonal campaign?" — open-ended curiosity.
+"""
+    
+    elif trigger_kind == "customer_lapsed_soft":
+        payload = facts.get("trigger_payload", {})
+        days_lapsed = payload.get("days_since_last_visit", 180)
+        customer_name = facts.get("customer_name", "")
+        return base_instruction + f"""
+TRIGGER: Soft lapse — customer who visited before, quiet for {days_lapsed}d+.
+STRATEGY:
+- Hook: Gentle nostalgia. "Been {days_lapsed} days since {customer_name}'s last visit — missing you."
+- Offer: 1 seasonal service or coupon from catalog.
+- CTA: Soft re-engage. "Want me to send them a 'we miss you' + special offer message?"
+"""
+    
+    elif trigger_kind == "review_theme_emerged":
+        payload = facts.get("trigger_payload", {})
+        theme = payload.get("theme", "common feedback")
+        return base_instruction + f"""
+TRIGGER: Review theme emerged.
+THEME: '{theme}' in {payload.get('count', 2)}+ reviews this month.
+STRATEGY:
+- Hook: Specific feedback pattern. "3 reviews mention {theme} — all positive/constructive/critical."
+- Action: Concrete response to theme (e.g., if wait time, offer a slot-booking system).
+- CTA: "Want me to address this + draft a response campaign?"
+"""
+    
+    elif trigger_kind == "dormant_with_vera":
+        payload = facts.get("trigger_payload", {})
+        days_silent = payload.get("days_silent", 14)
+        return base_instruction + f"""
+TRIGGER: Merchant has been silent {days_silent}d+.
+STRATEGY:
+- Hook: Friendly check-in. "Haven't heard from you in {days_silent} days — everything OK?"
+- Offer: 1 quick win. "One thing I noticed: [signal from merchant data]."
+- CTA: Low-friction re-engage. "Quick 2-min call?" or "One quick question?"
+"""
+    
+    elif trigger_kind == "milestone_reached":
+        payload = facts.get("trigger_payload", {})
+        milestone = payload.get("milestone", "big milestone")
+        return base_instruction + f"""
+TRIGGER: {milestone}.
+STRATEGY:
+- Hook: Celebration. "Congrats on {milestone}! 🎉"
+- Anchor: Data proof. "[Real achievement + impact]."
+- CTA: Capitalize. "Want to celebrate with a special offer to your fans?"
+"""
+    
+    elif trigger_kind == "category_trend_movement":
+        payload = facts.get("trigger_payload", {})
+        trend = payload.get("trend_name", "trend")
+        direction = payload.get("direction", "up")
+        pct = payload.get("pct_change", 20)
+        return base_instruction + f"""
+TRIGGER: Category trend movement.
+TREND: {trend} searches {direction} {pct}% YoY.
+STRATEGY:
+- Hook: Market shift. "Your category is shifting — {trend} searches up {pct}%."
+- Opportunity: Merchant-specific play. "Your catalog has [offer match] — ready to capture?"
+- CTA: "Want me to draft a campaign around this trend?"
+"""
+    
+    else:
+        # Fallback for unmapped trigger kinds
+        return base_instruction + """
+TRIGGER: General engagement.
+STRATEGY:
+- Hook: Lead with merchant's strongest opportunity from context.
+- Proof: Use real numbers from merchant data.
+- CTA: Single, clear, low-friction action.
+"""
+
+
+# ── Main composer function ────────────────────────────────────────────────
+def compose(
+    category: dict,
+    merchant: dict,
+    trigger: dict,
+    customer: dict = None,
+    conversation_history: list = None,
+    is_first_turn: bool = True,
+) -> Dict[str, Any]:
+    """
+    Core composition engine.
+    
+    Returns:
+    {
+        "body": str,           # WhatsApp message body
+        "cta": str,            # CTA type: "binary", "open_ended", "slot_selection", etc.
+        "send_as": str,        # "vera" or "merchant_on_behalf"
+        "suppression_key": str, # for dedup
+        "rationale": str,      # why this message was chosen
+    }
+    """
+    try:
+        # 1. Extract facts (never hallucinate from here)
+        facts = _extract_specifics(category, merchant, trigger, customer)
+        
+        # 2. Get language instruction
+        lang_instr = _get_language_instruction(merchant, customer)
+        
+        # 3. Build trigger-specific instruction
+        trigger_kind = trigger.get("kind", "generic")
+        trigger_instr = _build_trigger_instruction(trigger_kind, facts, category.get("slug", ""))
+        
+        # 4. Format facts as a clean JSON block for LLM
+        facts_json = json.dumps(facts, ensure_ascii=False, indent=2)
+        
+        # 5. Build the complete prompt
+        system_prompt = f"""{trigger_instr}
+
+FACTS PROVIDED (use ONLY these, never invent):
+{facts_json}
+
+LANGUAGE: {lang_instr}
+
+OUTPUT FORMAT (JSON):
+{{
+  "body": "WhatsApp message ≤160 chars",
+  "cta": "binary|open_ended|slot_selection|confirmation",
+  "send_as": "vera|merchant_on_behalf",
+  "rationale": "1-line why this message now"
+}}
+"""
+        
+        client = _get_client()
+        response = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=500,
+            temperature=0,  # Deterministic
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": f"Compose the next message for {trigger_kind} trigger. Use only facts provided. Output JSON only."
+                }
+            ]
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            logger.warning(f"No JSON in response for {trigger_kind}")
+            return _fallback_response(trigger_kind, facts, merchant)
+        
+        result = json.loads(json_match.group())
+        
+        # Validate result
+        body = (result.get("body") or "").strip()
+        if not body:
+            logger.warning(f"Empty body for {trigger_kind}")
+            return _fallback_response(trigger_kind, facts, merchant)
+        
+        # Ensure single CTA
+        cta = result.get("cta", "open_ended")
+        if cta not in ["binary", "open_ended", "slot_selection", "confirmation"]:
+            cta = "open_ended"
+        
+        send_as = result.get("send_as", "vera")
+        if customer and trigger.get("scope") == "customer":
+            send_as = "merchant_on_behalf"
+        
+        return {
+            "body": body,
+            "cta": cta,
+            "send_as": send_as,
+            "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id')}"),
+            "rationale": result.get("rationale", f"Composed for {trigger_kind} trigger")
+        }
+    
+    except Exception as e:
+        logger.error(f"Compose error: {e}")
+        return _fallback_response(trigger.get("kind", "generic"), {}, merchant)
+
+
+def _fallback_response(trigger_kind: str, facts: dict, merchant: dict) -> Dict[str, Any]:
+    """Fallback when LLM fails — still provide a sensible message."""
+    owner = merchant.get("identity", {}).get("owner_first_name", "there")
+    merchant_name = merchant.get("identity", {}).get("name", "your business")
+    
+    fallbacks = {
+        "research_digest": f"Hi {owner}, found something relevant to {merchant_name}. Want me to share ideas?",
+        "perf_dip": f"Hi {owner}, noticed a small dip this week. Want to discuss what might help?",
+        "perf_spike": f"Congrats {owner}! Your momentum is strong. Want to capitalize on it?",
+        "recall_due": f"Quick reminder from {merchant_name} — good time for your next visit.",
+        "generic": f"Hi {owner}, quick thought about {merchant_name}. Got 30 seconds?"
+    }
+    
+    return {
+        "body": fallbacks.get(trigger_kind, fallbacks["generic"]),
+        "cta": "open_ended",
+        "send_as": "vera",
+        "suppression_key": f"{trigger_kind}:{merchant.get('merchant_id')}",
+        "rationale": f"Fallback for {trigger_kind}"
+    }
+
+
+def compose_reply(
+    merchant: dict,
+    customer: dict,
+    trigger: dict,
+    category: dict,
+    merchant_reply: str,
+    conversation_history: list = None
+) -> Dict[str, Any]:
+    """
+    Compose a reply based on merchant's response.
+    Used in /reply endpoint.
+    
+    Returns same structure as compose().
+    """
+    # Similar extraction + LLM flow, but focused on continuing conversation
+    facts = _extract_specifics(category, merchant, trigger, customer)
+    lang_instr = _get_language_instruction(merchant, customer)
+    
+    system_prompt = f"""
+You are Vera, merchant growth assistant. A merchant just replied to a previous message.
+Analyze their reply and decide the next move: continue, confirm, end gracefully, or escalate.
+
+MERCHANT REPLIED: "{merchant_reply}"
+
+FACTS:
+{json.dumps(facts, ensure_ascii=False, indent=2)}
+
+RULES:
+- If they said YES/confirmed: move to EXECUTION mode (next action, timeline).
+- If they said NO/STOP/exit: graceful end + respect + no pressure.
+- If they asked a question: answer with facts provided only, never invent.
+- If they said something off-topic: polite redirect to Vera's scope.
+- Keep it short, conversational.
+
+OUTPUT (JSON):
+{{
+  "body": "reply message ≤160 chars",
+  "conversation_state": "active|ended|paused",
+  "rationale": "why this reply"
+}}
+"""
+    
+    try:
+        client = _get_client()
+        response = client.chat.completions.create(
+            model=MODEL,
+            max_tokens=300,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": f"Merchant replied: '{merchant_reply}'. What's Vera's next move?"
+                }
+            ]
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        
+        if json_match:
+            result = json.loads(json_match.group())
+            return {
+                "body": result.get("body", "Got it, thanks!"),
+                "send_as": "vera",
+                "suppression_key": f"reply:{trigger.get('id')}",
+                "rationale": result.get("rationale", "Reply to merchant message")
+            }
+    except Exception as e:
+        logger.error(f"Reply composition error: {e}")
+    
+    # Fallback
+    return {
+        "body": "Thanks for getting back to me. Let me know how I can help!",
+        "send_as": "vera",
+        "suppression_key": f"reply:{trigger.get('id')}",
+        "rationale": "Fallback reply"
+    }
