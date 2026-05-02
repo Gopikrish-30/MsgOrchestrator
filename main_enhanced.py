@@ -416,41 +416,37 @@ async def reply(body: ReplyBody):
     # If auto-reply, handle gracefully
     if analysis["is_auto_reply"]:
         auto_count = conv.get("auto_reply_count", 0)
-        if auto_count >= 3:
-            # Hard end after 3 auto-replies
+        # New policy: attempt one short different-angle send on first auto-reply,
+        # then end gracefully on the second auto-reply.
+        owner = (context_store.get_merchant(merchant_id) or {}).get("identity", {}).get("owner_first_name") or "there"
+        if auto_count == 1:
+            # Try once more with a short different-angle message
+            followup = conversation.alternate_followup_message(owner)
+            conversation.record_bot_turn(conv_id, followup)
+            response = {
+                "action": "send",
+                "reply": followup,
+                "body": followup,
+                "cta": "open_ended",
+                "conversation_state": "active",
+                "rationale": "Auto-reply detected; sending one short different-angle follow-up.",
+                "suppression_key": f"auto_reply_followup:{conv_id}",
+            }
+            logger.info(f"Sent alternate follow-up after auto-reply: {conv_id}")
+            return response
+        else:
+            # Second (or more) auto-reply — end gracefully and suppress
             SUPPRESSED_CONVOS.add(conv_id)
+            exit_msg = conversation.graceful_exit_message(owner, True)
+            conversation.record_bot_turn(conv_id, exit_msg)
             response = {
                 "action": "end",
                 "conversation_state": "ended",
-                "suppression_key": f"auto_reply_hard_end:{conv_id}",
-                "rationale": "Auto-reply detected repeatedly; closing conversation.",
-                "reply": ""
+                "suppression_key": f"auto_reply_end:{conv_id}",
+                "rationale": "Auto-reply detected repeatedly; closing conversation after follow-up.",
+                "reply": exit_msg
             }
-            logger.info(f"Hard end after 3 auto-replies: {conv_id}")
-            return response
-        elif auto_count == 1:
-            # First auto-reply, back off immediately for a fresh conversation.
-            response = {
-                "action": "wait",
-                "wait_seconds": 14400,
-                "conversation_state": "paused",
-                "suppression_key": f"auto_reply_first:{conv_id}",
-                "rationale": "Detected merchant auto-reply; backing off before the next attempt.",
-                "reply": ""
-            }
-            logger.info(f"Backing off after auto-reply: {conv_id}")
-            return response
-        else:
-            # 2nd auto-reply, wait 24h
-            response = {
-                "action": "wait",
-                "wait_seconds": 86400,
-                "conversation_state": "paused",
-                "suppression_key": f"auto_reply_wait_24h:{conv_id}",
-                "rationale": "Repeated auto-reply detected; waiting 24 hours.",
-                "reply": ""
-            }
-            logger.info(f"Waiting 24h after 2nd auto-reply: {conv_id}")
+            logger.info(f"Ending conversation after repeated auto-replies: {conv_id}")
             return response
 
     # If action intent, move to execution mode

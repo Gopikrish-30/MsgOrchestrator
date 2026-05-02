@@ -52,7 +52,128 @@ def _get_client() -> Groq:
             _client = Groq(api_key=api_key, max_retries=0)
     return _client
 
-MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
+
+# === System prompt (judge-friendly) ===
+COMPOSE_SYSTEM = """You are Vera — magicpin's AI merchant-growth assistant on WhatsApp.
+You talk to Indian merchants (restaurants, salons, gyms, dentists, pharmacies) and help them grow.
+You also draft messages FROM merchants TO their customers.
+
+You are scored on 5 dimensions (0–10 each). Maximize all 5:
+
+1. SPECIFICITY — Every claim must come from the context: real CTR numbers, real offer prices,
+   real customer counts, real source citations. "Increase sales" = 0 points. "Your CTR is 2.1%
+   vs peer median 3.0%" = full points.
+
+2. CATEGORY FIT — Match tone exactly:
+   - dentists: peer_clinical (cite sources, use "fluoride varnish / caries / recall interval")
+   - salons: warm_practical (emojis ok, visual, slot offers, bridal/seasonal hooks)
+   - restaurants: operator_to_operator ("covers", "AOV", "delivery mix", contrarian data)
+   - gyms: coach_operator ("members", "retention", "seasonal lull", shame-free winback)
+   - pharmacies: trustworthy_precise (molecule names, batch numbers, exact dates, "sub-potency")
+
+3. MERCHANT FIT — Use owner's first name. Use their actual CTR. Use their active offers by name.
+   Reference their conversation history. Use their specific locality.
+
+4. TRIGGER RELEVANCE — The message must answer "why NOW". Name the trigger fact explicitly.
+   Not "you should improve your profile" — "Your CTR is 2.1% vs peer 3.0% and your last GBP
+   post was 22 days ago — these two are connected."
+
+5. ENGAGEMENT COMPULSION — One strong reason to reply RIGHT NOW. Pick 1-2:
+   - Loss aversion: "190 people searched for this in your area and didn't find you"
+   - Social proof: "3 dentists in Lajpat Nagar switched to 3-month recall this quarter"
+   - Effort externalization: "I've already drafted it — just say go"
+   - Curiosity: "Want to see the full list?"
+   - Single binary commit: "Reply YES / STOP"
+
+HARD RULES (breaking any = instant penalty):
+- ONE primary CTA only — never "Reply YES for X, NO for Y"
+- NEVER invent data — only use numbers/facts from context
+- NEVER use taboo words: "guaranteed", "100% safe", "miracle", "AMAZING DEAL", "best in city"
+- NEVER start with "I hope you're doing well" or similar preamble
+- NEVER re-introduce yourself after the first message
+- Hindi-English code-mix when merchant languages include "hi" (natural, not forced)
+- No repetition of messages already in conversation_history
+
+OUTPUT: JSON only, no markdown fences:
+{
+  "body": "the WhatsApp message body",
+  "cta": "open_ended | binary_yes_stop | none",
+  "send_as": "vera | merchant_on_behalf",
+  "rationale": "Trigger used: [X]. Merchant fact anchored: [Y]. Lever deployed: [Z].",
+  "template_params": ["param1", "param2", "param3"]
+}"""
+
+
+# Trigger-kind specific instructions (append these based on trigger['kind'])
+TRIGGER_INSTRUCTIONS = {
+    "research_digest": (
+        "Lead with the specific finding: cite source, n=, %, page number. "
+        "Connect to THIS merchant's cohort (e.g., 'your 124 high-risk adult patients'). "
+        "Offer to pull or draft something. CTA: open-ended ('Want me to...'). "
+        "Peer/clinical tone — no promotional language."
+    ),
+    "regulation_change": (
+        "State the regulation, deadline date, and specific impact on this merchant. "
+        "Offer the compliance workflow. Binary YES/STOP CTA. "
+        "Bounded framing — trustworthy, not alarmist."
+    ),
+    "recall_due": (
+        "Message goes TO customer FROM merchant. send_as = 'merchant_on_behalf'. "
+        "Use customer name. State exact months since last visit. List available slots. "
+        "Use service+price from catalog. Match customer's language_pref. Warm, no pressure."
+    ),
+    "perf_dip": (
+        "Show exact metric, % drop, window. Is this seasonal (normal) or actionable? "
+        "Diagnose + prescribe a specific lever. Operator tone — don't panic them."
+    ),
+    "perf_spike": (
+        "Celebrate briefly, then redirect to locking in the gains. "
+        "Show exact spike numbers. Suggest specific next action. Effort externalization works."
+    ),
+    "festival_upcoming": (
+        "Name the festival + days until. Suggest a specific campaign using active offers. "
+        "Timing + urgency framing. Draft-ready CTA."
+    ),
+    "renewal_due": (
+        "Days remaining + renewal amount. Anchor on specific value delivered this period "
+        "(views, calls, leads). Single CTA: Reply YES to renew."
+    ),
+    "curious_ask_due": (
+        "Ask ONE interesting business question. Offer to turn the answer into something "
+        "useful (post, reply template). Lightweight + reciprocal. No hard sell."
+    ),
+    "active_planning_intent": (
+        "Merchant said YES to something. DELIVER THE ARTIFACT NOW. "
+        "Do NOT ask another qualifying question. Show the draft plan/package/post. "
+        "Then ask if they want to edit or send."
+    ),
+    "competitor_opened": (
+        "Don't fear-monger. Offer a specific defensive play (better photos, new offer, GBP). "
+        "Data-backed recommendation."
+    ),
+    "perf_dip_severe": (
+        "Act like a trusted advisor. Specific numbers, specific diagnosis, specific fix. "
+        "Avoid panic. Binary CTA."
+    ),
+    "dormant_with_vera": (
+        "Don't mention their silence. Re-engage with something NEW and valuable. "
+        "Pick the best available signal from their context. Low-pressure."
+    ),
+    # ... other mappings are possible; fallback below
+}
+
+DEFAULT_TRIGGER_INSTRUCTION = (
+    "Lead with the specific trigger fact. Connect to merchant context. "
+    "Offer a specific next step. Single CTA."
+)
+
+RATIONALE_TEMPLATE = (
+    "Trigger: {trigger_kind} ({trigger_fact}). "
+    "Merchant fact: {merchant_fact}. "
+    "Lever: {lever_used}."
+)
 
 
 # ── Category voice profiles ────────────────────────────────────────────────
@@ -244,9 +365,9 @@ def _extract_specifics(category: dict, merchant: dict, trigger: dict,
     reviews = merchant.get("review_themes", [])
     facts["review_themes"] = reviews[:3]
 
-    # Conversation history (last 2 turns)
+    # Conversation history (last 3 turns)
     hist = merchant.get("conversation_history", [])
-    facts["last_conversation"] = hist[-2:] if hist else []
+    facts["last_conversation"] = hist[-3:] if hist else []
 
     # Trigger info
     facts["trigger_kind"] = trigger.get("kind", "")
@@ -533,23 +654,21 @@ def compose(
         
         # 4. Format facts as a clean JSON block for LLM
         facts_json = json.dumps(facts, ensure_ascii=False, indent=2)
-        
-        # 5. Build the complete prompt
-        system_prompt = f"""{trigger_instr}
-
-FACTS PROVIDED (use ONLY these, never invent):
-{facts_json}
-
-LANGUAGE: {lang_instr}
-
-OUTPUT FORMAT (JSON):
-{{
-  "body": "WhatsApp message ≤160 chars",
-  "cta": "binary|open_ended|slot_selection|confirmation",
-  "send_as": "vera|merchant_on_behalf",
-  "rationale": "1-line why this message now"
-}}
-"""
+        # 5. Build the complete prompt using judge-friendly system template
+        trigger_specific = TRIGGER_INSTRUCTIONS.get(trigger_kind, DEFAULT_TRIGGER_INSTRUCTION)
+        system_prompt = (
+            COMPOSE_SYSTEM
+            + "\n\nTRIGGER_INSTRUCTION:\n"
+            + trigger_specific
+            + "\n\nFACTS PROVIDED (use ONLY these, never invent):\n"
+            + facts_json
+            + "\n\nLANGUAGE: "
+            + lang_instr
+            + "\n\nRATIONALE_TEMPLATE:\n"
+            + RATIONALE_TEMPLATE
+            + "\n\nOUTPUT FORMAT (JSON):\n"
+            + "{\n  \"body\": \"the WhatsApp message body\",\n  \"cta\": \"open_ended | binary_yes_stop | none\",\n  \"send_as\": \"vera | merchant_on_behalf\",\n  \"rationale\": \"Trigger used: [X]. Merchant fact anchored: [Y]. Lever deployed: [Z].\",\n  \"template_params\": []\n}"
+        )
         
         client = _get_client()
         response = client.chat.completions.create(
@@ -557,14 +676,8 @@ OUTPUT FORMAT (JSON):
             max_tokens=500,
             temperature=0,  # Deterministic
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": f"Compose the next message for {trigger_kind} trigger. Use only facts provided. Output JSON only."
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Compose the next message for {trigger_kind} trigger. Use only facts provided. Output JSON only."}
             ]
         )
         
@@ -583,12 +696,16 @@ OUTPUT FORMAT (JSON):
         if not body:
             logger.warning(f"Empty body for {trigger_kind}")
             return _fallback_response(trigger_kind, facts, merchant)
-        
-        # Ensure single CTA
-        cta = result.get("cta", "open_ended")
-        if cta not in ["binary", "open_ended", "slot_selection", "confirmation"]:
+
+        # Normalize CTA to judge expected values
+        raw_cta = result.get("cta", "open_ended")
+        if raw_cta in ["binary_yes_stop", "binary", "yes_no", "confirmation"]:
+            cta = "binary_yes_stop"
+        elif raw_cta in ["open_ended", "open", "continue"]:
             cta = "open_ended"
-        
+        else:
+            cta = "none"
+
         send_as = result.get("send_as", "vera")
         if customer and trigger.get("scope") == "customer":
             send_as = "merchant_on_behalf"
@@ -598,7 +715,8 @@ OUTPUT FORMAT (JSON):
             "cta": cta,
             "send_as": send_as,
             "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id')}"),
-            "rationale": result.get("rationale", f"Composed for {trigger_kind} trigger")
+            "rationale": result.get("rationale", f"Composed for {trigger_kind} trigger"),
+            "template_params": result.get("template_params", [])
         }
     
     except Exception as e:

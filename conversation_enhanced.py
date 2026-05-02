@@ -253,3 +253,24 @@ def clear():
     """Clear all conversations (for testing)."""
     with _lock:
         _conversations.clear()
+
+
+def graceful_exit_message(merchant_name: str, is_auto_reply: bool) -> str:
+    if is_auto_reply:
+        return (
+            f"Koi baat nahi, samajh gayi — looks like this number has an auto-reply active. "
+            f"Main {merchant_name} ke account mein notes add kar dungi. "
+            f"Jab bhi time mile, feel free to reach out! 🙂"
+        )
+    return (
+        f"Bilkul samajh gayi. Koi zarurat ho toh feel free to reach out — "
+        f"main hamesha available hoon. 👋"
+    )
+
+
+def alternate_followup_message(merchant_name: str) -> str:
+    """Produce a short different-angle follow-up when an auto-reply is detected."""
+    return (
+        f"Quick follow — if you'd like, I can draft the message and schedule it for {merchant_name}. "
+        f"Reply YES to have it ready, or STOP to cancel."
+    )
