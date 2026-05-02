@@ -154,7 +154,7 @@ async def metadata():
     return {
         "team_name": os.getenv("TEAM_NAME", "Vera Engine v2"),
         "team_members": [m.strip() for m in os.getenv("TEAM_MEMBERS", "Solo Builder").split(",")],
-        "model": f"{os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')} via Groq",
+        "model": f"{os.getenv('GROQ_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')} via Groq",
         "approach": (
             "4-context dispatch engine: "
             "1) Extract concrete facts only (never hallucinate). "
@@ -444,7 +444,7 @@ async def reply(body: ReplyBody):
                 "conversation_state": "ended",
                 "suppression_key": f"auto_reply_end:{conv_id}",
                 "rationale": "Auto-reply detected repeatedly; closing conversation after follow-up.",
-                "reply": exit_msg
+                "body": exit_msg
             }
             logger.info(f"Ending conversation after repeated auto-replies: {conv_id}")
             return response
@@ -470,11 +470,10 @@ async def reply(body: ReplyBody):
                 if reply_text:
                     conversation.record_bot_turn(conv_id, reply_text)
                     response = {
-                            "action": result.get("action", "send"),
-                            "reply": reply_text,
-                            "body": reply_text,
-                            "cta": result.get("cta", "open_ended"),
-                            "rationale": result.get("rationale", "Composed execution-mode reply."),
+                        "action": result.get("action", "send"),
+                        "body": reply_text,
+                        "cta": result.get("cta", "open_ended"),
+                        "rationale": result.get("rationale", "Composed execution-mode reply."),
                         "conversation_state": "active",
                         "suppression_key": f"execution_mode:{conv_id}",
                     }
@@ -486,16 +485,32 @@ async def reply(body: ReplyBody):
     # Default: acknowledgment + keep conversation alive
     response = {
         "action": "send",
-        "reply": "Thanks for the update. Anything else I can help with?",
         "body": "Thanks for the update. Anything else I can help with?",
         "cta": "open_ended",
         "conversation_state": "active",
         "rationale": "Default acknowledgment; keep the conversation alive.",
         "suppression_key": f"default_ack:{conv_id}",
     }
-    conversation.record_bot_turn(conv_id, response["reply"])
+    conversation.record_bot_turn(conv_id, response["body"])
     logger.info(f"Default acknowledgment: {conv_id}")
     return response
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 6: POST /v1/teardown (Judge cleanup endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/v1/teardown")
+async def teardown():
+    """Clear all state at end of test. Called by judge to reset between test runs."""
+    conversation.clear()
+    context_store.clear_all()
+    SUPPRESSED_CONVOS.clear()
+    CONV_META.clear()
+    logger.info("Teardown: all state cleared")
+    return {"status": "cleared"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

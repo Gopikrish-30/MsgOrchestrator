@@ -652,10 +652,21 @@ def compose(
         trigger_kind = trigger.get("kind", "generic")
         trigger_instr = _build_trigger_instruction(trigger_kind, facts, category.get("slug", ""))
         
-        # 4. Format facts as a clean JSON block for LLM
-        facts_json = json.dumps(facts, ensure_ascii=False, indent=2)
-        # 5. Build the complete prompt using judge-friendly system template
-        trigger_specific = TRIGGER_INSTRUCTIONS.get(trigger_kind, DEFAULT_TRIGGER_INSTRUCTION)
+        # 4. Trim facts to reduce context bloat (avoid LLM truncation)
+        facts_trimmed = dict(facts)
+        if "category_digest" in facts_trimmed:
+            facts_trimmed["category_digest"] = facts_trimmed["category_digest"][:2]
+        if "active_offers" in facts_trimmed:
+            facts_trimmed["active_offers"] = facts_trimmed["active_offers"][:3]
+        if "last_conversation" in facts_trimmed:
+            facts_trimmed["last_conversation"] = facts_trimmed["last_conversation"][-2:]
+        
+        # 5. Format facts as a clean JSON block for LLM
+        facts_json = json.dumps(facts_trimmed, ensure_ascii=False, indent=2)
+        
+        # 6. Build the complete prompt using judge-friendly system template
+        # BUG FIX: use the detailed trigger_instr computed above, NOT the static dict
+        trigger_specific = trigger_instr
         system_prompt = (
             COMPOSE_SYSTEM
             + "\n\nTRIGGER_INSTRUCTION:\n"
@@ -673,7 +684,7 @@ def compose(
         client = _get_client()
         response = client.chat.completions.create(
             model=MODEL,
-            max_tokens=500,
+            max_tokens=800,  # Bumped from 500 to avoid truncation
             temperature=0,  # Deterministic
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -811,7 +822,11 @@ OUTPUT (JSON):
         
         if json_match:
             result = json.loads(json_match.group())
+            # BUG FIX: include action field so main_enhanced.py can use LLM-driven exits
+            conv_state = result.get("conversation_state", "active")
+            action = "end" if conv_state == "ended" else ("wait" if conv_state == "paused" else "send")
             return {
+                "action": action,
                 "body": result.get("body", "Got it, thanks!"),
                 "send_as": "vera",
                 "suppression_key": f"reply:{trigger.get('id')}",
@@ -822,6 +837,7 @@ OUTPUT (JSON):
     
     # Fallback
     return {
+        "action": "send",
         "body": "Thanks for getting back to me. Let me know how I can help!",
         "send_as": "vera",
         "suppression_key": f"reply:{trigger.get('id')}",
