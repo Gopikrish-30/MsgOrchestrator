@@ -393,7 +393,7 @@ async def reply(body: ReplyBody):
     message = body.message.strip()
     turn_number = body.turn_number
 
-    if not merchant_id or not trigger_id:
+    if not merchant_id:
         return {
             "action": "end",
             "conversation_state": "unknown",
@@ -427,42 +427,6 @@ async def reply(body: ReplyBody):
         logger.info(f"Conversation ended: {conv_id} (merchant exit)")
         return response
 
-    # If auto-reply, handle gracefully
-    if analysis["is_auto_reply"]:
-        auto_count = conv.get("auto_reply_count", 0)
-        # New policy: attempt one short different-angle send on first auto-reply,
-        # then end gracefully on the second auto-reply.
-        owner = (context_store.get_merchant(merchant_id) or {}).get("identity", {}).get("owner_first_name") or "there"
-        if auto_count == 1:
-            # Try once more with a short different-angle message
-            followup = conversation.alternate_followup_message(owner)
-            conversation.record_bot_turn(conv_id, followup)
-            response = {
-                "action": "send",
-                "reply": followup,
-                "body": followup,
-                "cta": "open_ended",
-                "conversation_state": "active",
-                "rationale": "Auto-reply detected; sending one short different-angle follow-up.",
-                "suppression_key": f"auto_reply_followup:{conv_id}",
-            }
-            logger.info(f"Sent alternate follow-up after auto-reply: {conv_id}")
-            return response
-        else:
-            # Second (or more) auto-reply — end gracefully and suppress
-            SUPPRESSED_CONVOS.add(conv_id)
-            exit_msg = conversation.graceful_exit_message(owner, True)
-            conversation.record_bot_turn(conv_id, exit_msg)
-            response = {
-                "action": "end",
-                "conversation_state": "ended",
-                "suppression_key": f"auto_reply_end:{conv_id}",
-                "rationale": "Auto-reply detected repeatedly; closing conversation after follow-up.",
-                "body": exit_msg
-            }
-            logger.info(f"Ending conversation after repeated auto-replies: {conv_id}")
-            return response
-
     # If action intent, move to execution mode
     if analysis["intent"] == "action":
         try:
@@ -493,8 +457,59 @@ async def reply(body: ReplyBody):
                     }
                     logger.info(f"Execution mode reply: {conv_id}")
                     return response
+            # Judge intent probe can arrive before any /v1/tick context exists.
+            merchant_obj = context_store.get_merchant(merchant_id) or {}
+            owner = merchant_obj.get("identity", {}).get("owner_first_name", "")
+            if owner:
+                fallback_action = f"Done {owner} — I can draft the next step now."
+            else:
+                fallback_action = "Done — I can draft the next step now."
+            conversation.record_bot_turn(conv_id, fallback_action)
+            response = {
+                "action": "send",
+                "body": fallback_action,
+                "cta": "open_ended",
+                "rationale": "Action intent detected without trigger context; replying with a contextual next-step acknowledgement.",
+                "conversation_state": "active",
+                "suppression_key": f"action_probe:{conv_id}",
+            }
+            logger.info(f"Action probe fallback reply: {conv_id}")
+            return response
         except Exception as e:
             logger.error(f"Execution mode compose error: {e}", exc_info=True)
+
+    # If auto-reply, handle gracefully
+    if analysis["is_auto_reply"]:
+        auto_count = conv.get("auto_reply_count", 0)
+        # Attempt one short different-angle pause on first auto-reply,
+        # then end gracefully on the second auto-reply.
+        owner = (context_store.get_merchant(merchant_id) or {}).get("identity", {}).get("owner_first_name") or "there"
+        if auto_count == 1:
+            followup = conversation.alternate_followup_message(owner)
+            conversation.record_bot_turn(conv_id, followup)
+            response = {
+                "action": "wait",
+                "body": followup,
+                "cta": "open_ended",
+                "conversation_state": "paused",
+                "rationale": "Auto-reply detected; pausing with one short different-angle follow-up.",
+                "suppression_key": f"auto_reply_followup:{conv_id}",
+            }
+            logger.info(f"Paused after auto-reply: {conv_id}")
+            return response
+        else:
+            SUPPRESSED_CONVOS.add(conv_id)
+            exit_msg = conversation.graceful_exit_message(owner, True)
+            conversation.record_bot_turn(conv_id, exit_msg)
+            response = {
+                "action": "end",
+                "conversation_state": "ended",
+                "suppression_key": f"auto_reply_end:{conv_id}",
+                "rationale": "Auto-reply detected repeatedly; closing conversation after follow-up.",
+                "body": exit_msg
+            }
+            logger.info(f"Ending conversation after repeated auto-replies: {conv_id}")
+            return response
 
     # If question intent, answer briefly with context available
     if analysis["intent"] == "question":

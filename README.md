@@ -1,23 +1,102 @@
 # Vera Bot
 
-Vera Bot is a FastAPI service that turns merchant, category, trigger, and customer context into short WhatsApp-ready messages. It is built to be deterministic, context-grounded, and easy to run locally or deploy.
+Vera Bot is a FastAPI service that turns merchant, category, trigger, and customer context into short WhatsApp-ready messages. The current version is tuned for the Magicpin AI Challenge: it is deterministic, context-grounded, judge-friendly, and ready for local execution or deployment.
 
-## What It Does
+## What This Build Includes
 
-- Composes proactive WhatsApp messages from live context
-- Tracks versioned context updates with idempotent behavior
-- Handles multi-turn replies with auto-reply and intent detection
-- Uses category voice rules so messages feel relevant to each business vertical
-- Generates the canonical 30 submission rows from the expanded dataset
+- Proactive message generation from live merchant, category, trigger, and customer context
+- Versioned, idempotent context storage with stale-version rejection
+- Multi-turn reply handling with auto-reply detection, action intent detection, offtopic redirects, and graceful exits
+- Judge-style action probes are handled even when trigger context has not been populated yet
+- Category-specific voice rules so messages feel native to each vertical
+- Trigger-specific dispatch logic with richer facts and dynamic instruction generation
+- Expanded dataset support and canonical `submission.jsonl` generation
+- Judge cleanup support through `/v1/teardown`
 
-## Core Features
+## Current API Surface
 
-- 5 endpoints: `/v1/healthz`, `/v1/metadata`, `/v1/context`, `/v1/tick`, `/v1/reply`
-- Groq-backed generation with `llama-3.1-8b-instant`
-- Deterministic output by default (`temperature=0`)
-- Thread-safe in-memory context storage
-- Reply handling for `send`, `wait`, and `end`
-- Explicit team metadata in `/v1/metadata`
+- `GET /v1/healthz` - service status, uptime, and loaded context counts
+- `GET /v1/metadata` - team info, model name, version, approach summary, and rubric targets
+- `POST /v1/context` - store category, merchant, customer, and trigger context with version control
+- `POST /v1/tick` - compose proactive WhatsApp actions from available trigger IDs
+- `POST /v1/reply` - process merchant replies and return `send`, `wait`, or `end`
+- `POST /v1/teardown` - clear in-memory state for judge resets and test cleanup
+
+## What Changed Recently
+
+This repo has been updated beyond the original baseline in a few important ways:
+
+- Model upgraded from the older 8B default to `meta-llama/llama-4-scout-17b-16e-instruct`
+- Prompting improved so the detailed trigger-specific instruction is actually used
+- Response budget expanded to reduce JSON truncation
+- Facts passed to the model are trimmed to keep the prompt focused
+- Reply composition now returns an explicit `action` field
+- `/v1/teardown` now exists and clears conversation and context state
+- Conversation handling now supports graceful exit after repeated auto-replies
+- Action probes are answered even without trigger context, preventing empty replies in judge simulations
+- Reply handling now includes better behavior for action, question, and offtopic intents
+- Fallback responses are more specific and context-aware
+
+## Core Behavior
+
+### Composition flow
+
+1. The app loads seed context at startup.
+2. `POST /v1/context` stores versioned category, merchant, trigger, and customer payloads.
+3. `POST /v1/tick` resolves the requested contexts, builds trigger-aware instructions, and calls Groq for composition.
+4. The model returns a JSON response with body, CTA, rationale, and send mode.
+5. The response is converted into an action payload for the judge or downstream harness.
+
+### Reply flow
+
+1. `POST /v1/reply` records the incoming merchant message.
+2. The conversation state machine checks for auto-replies, action intent, exit intent, offtopic content, and unanswered-message thresholds.
+3. If a judge-style action probe arrives before `/v1/tick`, the service still returns a next-step response instead of hard-failing on missing trigger context.
+4. The service either sends a follow-up, ends gracefully, or provides a contextual response.
+5. The reply path now supports `action: send | wait | end` instead of always falling back to send.
+
+## Key Implementation Details
+
+### `main_enhanced.py`
+
+- FastAPI entrypoint used by `uvicorn`, Docker, and the PaaS process file
+- Hosts all API routes and request/response models
+- Tracks conversation metadata for `/v1/reply` lookups
+- Includes teardown cleanup for judge test cycles
+- Implements question and offtopic handlers so replies do not collapse into a generic default
+
+### `composer_enhanced.py`
+
+- Uses the Scout model configured through `GROQ_MODEL`
+- Builds trigger-specific instructions dynamically instead of relying only on static templates
+- Trims large facts before JSON serialization to preserve output budget
+- Raises the token cap to reduce truncated responses
+- Produces a richer fallback response when the model cannot be used
+
+### `conversation_enhanced.py`
+
+- Maintains per-conversation turn history and counters
+- Detects auto-replies with pattern matching and repeat detection
+- Separates action, exit, question, and offtopic intent
+- Prevents a “thanks” false positive from overriding real action intent
+- Supports graceful exit messages and alternate follow-up messages
+
+### `context_store.py`
+
+- Thread-safe in-memory storage
+- Idempotent same-version updates
+- Rejects stale versions
+- Exposes `clear_all()` for teardown and keeps `clear()` as a compatibility alias
+
+## Dataset And Submission
+
+The project ships with an expanded dataset for challenge evaluation:
+
+- 50 merchants
+- 200 customers
+- 100 triggers
+- Canonical submission generation through `generate_submission.py`
+- `submission.jsonl` contains the 30 required rows for the challenge output format
 
 ## Project Structure
 
@@ -59,7 +138,7 @@ cp .env.example .env
 pip install -r requirements.txt
 ```
 
-4. Add your Groq API key and project details to `.env`.
+4. Add your Groq API key and project metadata to `.env`.
 
 5. Start the app.
 
@@ -67,31 +146,14 @@ pip install -r requirements.txt
 uvicorn main_enhanced:app --host 0.0.0.0 --port 8080
 ```
 
+## Environment Variables
 
-## End-to-End Flow
-
-1. `seed_loader.py` loads the seed dataset into memory on startup.
-2. `POST /v1/context` stores category, merchant, customer, and trigger context.
-3. `POST /v1/tick` selects triggers and composes proactive messages.
-4. `POST /v1/reply` processes merchant replies and decides whether to send, wait, or end.
-5. `generate_submission.py` expands the dataset and creates the canonical `submission.jsonl` artifact.
-
-## API Endpoints
-
-### `GET /v1/healthz`
-Returns service status, uptime, and loaded context counts.
-
-### `GET /v1/metadata`
-Returns team name, team members, model name, version, contact email, and approach summary.
-
-### `POST /v1/context`
-Stores versioned context. Same version is idempotent; stale versions are rejected.
-
-### `POST /v1/tick`
-Composes proactive actions from the available trigger IDs and returns an `actions` array.
-
-### `POST /v1/reply`
-Handles merchant or customer replies and returns `action: send | wait | end`.
+- `GROQ_API_KEY` - required for model access
+- `GROQ_MODEL` - defaults to `meta-llama/llama-4-scout-17b-16e-instruct`
+- `GROQ_BASE_URL` - Groq API base URL
+- `TEAM_NAME` - displayed in `/v1/metadata`
+- `TEAM_MEMBERS` - displayed in `/v1/metadata`
+- `VERSION` - optional build/version tag
 
 ## Local Testing
 
@@ -103,9 +165,18 @@ python dataset/generate_dataset.py --seed-dir dataset --out expanded
 python generate_submission.py
 ```
 
+For a quick runtime check, verify these endpoints after startup:
+
+- `/v1/healthz`
+- `/v1/metadata`
+- `/v1/context`
+- `/v1/tick`
+- `/v1/reply`
+- `/v1/teardown`
+
 ## Deployment
 
-The repo is configured to run with `main_enhanced:app`.
+The repository is configured to run with `main_enhanced:app`.
 
 ### Docker
 
@@ -118,11 +189,11 @@ docker run -p 8080:8080 --env-file .env vera-bot
 
 Set the same environment variables in your hosting platform and use the `Procfile` or Dockerfile as your entrypoint.
 
-## Configuration Notes
+## Notes On Output Quality
 
-- Use `llama-3.1-8b-instant` unless you have a specific reason to change models.
-- Keep `GROQ_API_KEY` in `.env`, not in source control.
-- Do not commit `submission.jsonl`; it is generated from the dataset.
+- The model prompt is structured to favor specificity, category fit, merchant fit, trigger relevance, and engagement
+- Trigger-specific facts are prioritized so the bot can mention concrete numbers, offers, and context
+- The system is designed to avoid generic fallback text unless generation fails
 
 ## Evaluation
 
