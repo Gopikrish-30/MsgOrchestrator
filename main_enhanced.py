@@ -43,6 +43,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vera-bot")
 
+
+def _env_value(name: str, default: str, invalid_values: Optional[set] = None) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return default
+    if invalid_values and value.lower() in invalid_values:
+        return default
+    return value
+
 # ── Lifespan + App setup ──────────────────────────────────────────────────
 from contextlib import asynccontextmanager
 
@@ -162,9 +171,19 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     """Metadata about the bot, team, and approach."""
+    team_name = _env_value(
+        "TEAM_NAME",
+        "Vera Engine",
+        invalid_values={"gen-z", "your team", "your team name", "vera engine v2"},
+    )
+    team_members = _env_value("TEAM_MEMBERS", "Your Name")
+    github_repo = _env_value(
+        "GITHUB_REPO",
+        "https://github.com/Gopikrish-30/MsgOrchestrator",
+    )
     return {
-        "team_name": os.getenv("TEAM_NAME", "Vera Engine v2"),
-        "team_members": [m.strip() for m in os.getenv("TEAM_MEMBERS", "Solo Builder").split(",")],
+        "team_name": team_name,
+        "team_members": [m.strip() for m in team_members.split(",") if m.strip()],
         "model": f"{os.getenv('GROQ_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct')} via Groq",
         "approach": (
             "4-context dispatch engine: "
@@ -175,8 +194,8 @@ async def metadata():
             "5) Conversation state machine (auto-reply detection, intent clarity, graceful exit). "
             "6) All outputs grounded in provided context."
         ),
-        "contact_email": os.getenv("CONTACT_EMAIL", "builder@example.com"),
-        "github": os.getenv("GITHUB_REPO", ""),
+        "contact_email": _env_value("CONTACT_EMAIL", "you@example.com"),
+        "github": github_repo,
         "version": "2.0.0-enhanced",
         "rubric_targets": {
             "decision_quality": "Trigger fit + merchant state + category fit all evident",
@@ -492,8 +511,8 @@ async def reply(body: ReplyBody):
     # If auto-reply, handle gracefully
     if analysis["is_auto_reply"]:
         auto_count = conv.get("auto_reply_count", 0)
-        # Attempt one short different-angle pause on first auto-reply,
-        # then end gracefully on the second auto-reply.
+        # Attempt one short different-angle pause on the first auto-reply,
+        # then end gracefully on the second (or any repeated) auto-reply.
         owner = (context_store.get_merchant(merchant_id) or {}).get("identity", {}).get("owner_first_name") or "there"
         if auto_count == 1:
             followup = conversation.alternate_followup_message(owner)
