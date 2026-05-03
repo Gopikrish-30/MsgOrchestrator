@@ -189,6 +189,60 @@ docker run -p 8080:8080 --env-file .env vera-bot
 
 Set the same environment variables in your hosting platform and use the `Procfile` or Dockerfile as your entrypoint.
 
+## Deploy to Railway (recommended)
+
+This is the easiest, repeatable method: connect your GitHub repo to Railway and enable automatic deploys from `master`.
+
+1. Prepare and push your changes to GitHub (from `vera-bot/`):
+
+```bash
+# from inside vera-bot/
+git status
+git add .
+git commit -m "chore: final README + deployment instructions"
+git push origin master
+```
+
+2. Create a Railway project (web UI is simplest):
+
+- Open https://railway.app and sign in with GitHub.
+- Click **New Project → Deploy from GitHub**.
+- Select the `Gopikrish-30/MsgOrchestrator` repository and the `master` branch.
+
+3. Configure Railway environment variables (in Railway project → Settings → Variables):
+
+```
+GROQ_API_KEY=sk-...                    # required
+GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+TEAM_NAME=Vera Engine
+TEAM_MEMBERS=Your Name
+CONTACT_EMAIL=you@example.com
+PORT=8080
+```
+
+4. Set the start command and build settings (Railway may auto-detect):
+
+- **Start Command:** `uvicorn main_enhanced:app --host 0.0.0.0 --port 8080`
+- **Build Command:** `pip install -r requirements.txt`
+
+5. Deploy
+
+- Trigger a deploy from the Railway UI or push a new commit to `master`.
+- Monitor build logs in Railway; once healthy, your service will be public at the Railway-assigned URL.
+
+Railway CLI alternative (optional):
+
+```bash
+# Install CLI: https://docs.railway.app/develop/cli
+railway login
+railway init         # follow prompts to link/create a project
+railway up           # deploy current repo
+```
+
+Why this method: GitHub integration + Railway gives automatic CI, secrets management, and a simple UI to see logs and redeploy — minimal ops overhead and ideal for fast iteration.
+
+
 ## Notes On Output Quality
 
 - The model prompt is structured to favor specificity, category fit, merchant fit, trigger relevance, and engagement
