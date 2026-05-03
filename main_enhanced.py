@@ -95,6 +95,7 @@ START_TIME = time.time()
 # ── State tracking ─────────────────────────────────────────────────────────
 SUPPRESSED_CONVOS: set = set()  # conversation_id → suppressed (merchant said stop)
 CONV_META: Dict[str, Dict[str, Any]] = {}  # conv_id → {merchant_id, trigger_id, customer_id}
+AUTO_REPLY_COUNT_BY_MERCHANT: Dict[str, int] = {}
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
@@ -447,6 +448,7 @@ async def reply(body: ReplyBody):
     # If exit intent or suppressed — end gracefully
     if analysis["intent"] == "exit":
         SUPPRESSED_CONVOS.add(conv_id)
+        AUTO_REPLY_COUNT_BY_MERCHANT.pop(merchant_id, None)
         response = {
             "action": "end",
             "conversation_state": "ended",
@@ -510,9 +512,11 @@ async def reply(body: ReplyBody):
 
     # If auto-reply, handle gracefully
     if analysis["is_auto_reply"]:
-        auto_count = conv.get("auto_reply_count", 0)
+        auto_count = AUTO_REPLY_COUNT_BY_MERCHANT.get(merchant_id, 0) + 1
+        AUTO_REPLY_COUNT_BY_MERCHANT[merchant_id] = auto_count
         # Attempt one short different-angle pause on the first auto-reply,
-        # then end gracefully on the second (or any repeated) auto-reply.
+        # then end gracefully on the second (or any repeated) auto-reply,
+        # even when the judge uses separate conversation IDs.
         owner = (context_store.get_merchant(merchant_id) or {}).get("identity", {}).get("owner_first_name") or "there"
         if auto_count == 1:
             followup = conversation.alternate_followup_message(owner)
@@ -540,6 +544,9 @@ async def reply(body: ReplyBody):
             }
             logger.info(f"Ending conversation after repeated auto-replies: {conv_id}")
             return response
+
+    # A normal merchant reply breaks the merchant-level auto-reply streak.
+    AUTO_REPLY_COUNT_BY_MERCHANT.pop(merchant_id, None)
 
     # If question intent, answer briefly with context available
     if analysis["intent"] == "question":
@@ -612,6 +619,7 @@ async def teardown():
     context_store.clear_all()
     SUPPRESSED_CONVOS.clear()
     CONV_META.clear()
+    AUTO_REPLY_COUNT_BY_MERCHANT.clear()
     logger.info("Teardown: all state cleared")
     return {"status": "cleared"}
 
