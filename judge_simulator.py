@@ -44,8 +44,8 @@ LLM_MODEL = _os.getenv("LLM_MODEL") or LLM_MODEL
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"
 
-# Which test to run by default
-TEST_SCENARIO = "all"
+# Which test to run by default (can be overridden via env TEST_SCENARIO)
+TEST_SCENARIO = _os.getenv("TEST_SCENARIO", "all")
 
 # =============================================================================
 # ██████  END OF CONFIGURATION - DON'T EDIT BELOW THIS LINE ██████
