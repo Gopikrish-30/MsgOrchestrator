@@ -38,7 +38,8 @@ LLM_PROVIDER = _os.getenv("LLM_PROVIDER", os.getenv("LLM_PROVIDER") if 'os' in g
 LLM_MODEL = _os.getenv("LLM_MODEL") or globals().get('LLM_MODEL', '')
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
-LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
+# Allow explicit model override from environment if present
+LLM_MODEL = _os.getenv("LLM_MODEL") or LLM_MODEL
 
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"
