@@ -70,6 +70,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+async def root():
+    """Simple landing endpoint for browsers and platform checks."""
+    return {
+        "status": "ok",
+        "service": "Vera Challenge Bot",
+        "healthz": "/v1/healthz",
+        "metadata": "/v1/metadata",
+    }
+
 START_TIME = time.time()
 
 # ── State tracking ─────────────────────────────────────────────────────────
