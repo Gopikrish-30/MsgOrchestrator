@@ -29,6 +29,11 @@ LLM_PROVIDER = "openai"
 # Your API key (paste your key here)
 LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
 
+# Allow reading API key from environment for convenience when running non-interactively
+import os as _os
+if not LLM_API_KEY:
+    LLM_API_KEY = _os.getenv("LLM_API_KEY") or _os.getenv("GROQ_API_KEY") or _os.getenv("OPENAI_API_KEY") or ""
+
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
 LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
 
