@@ -165,6 +165,24 @@ async def healthz():
     }
 
 
+    # Template variants: two optimized CTA templates per trigger kind
+    TEMPLATE_VARIANTS = {
+        "binary": ["binary_v1", "binary_v2"],
+        "slot_selection": ["slots_v1", "slots_v2"],
+        "open_ended": ["v1", "v2"],
+    }
+
+    # Load templates file (optional)
+    TEMPLATES = {}
+    try:
+        tpl_path = os.path.join(os.path.dirname(__file__), "templates", "templates.json")
+        if os.path.exists(tpl_path):
+            with open(tpl_path, "r", encoding="utf-8") as _tf:
+                TEMPLATES = json.load(_tf)
+    except Exception:
+        TEMPLATES = {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINT 2: GET /v1/metadata
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,18 +433,60 @@ async def tick(body: TickBody):
 
         # Build template_name based on CTA and trigger kind to provide richer templates
         raw_cta = result.get("cta", "open_ended")
+        # map normalized CTA to variant key
         if raw_cta == "binary_yes_stop":
-            template_name = f"vera_{trg_kind}_binary_v1"
+            variant_key = "binary"
         elif raw_cta == "slot_selection":
-            template_name = f"vera_{trg_kind}_slots_v1"
+            variant_key = "slot_selection"
         else:
-            template_name = f"vera_{trg_kind}_v1"
+            variant_key = "open_ended"
+
+        # Pick one of two optimized templates deterministically by merchant_id hash
+        variants = TEMPLATE_VARIANTS.get(variant_key, ["v1"])
+        try:
+            choice_idx = (sum(ord(c) for c in (merchant_id or "")) % len(variants))
+        except Exception:
+            choice_idx = 0
+        variant = variants[choice_idx]
+        # Compose template name
+        if variant_key == "binary":
+            template_name = f"vera_{trg_kind}_binary_{variant}"
+        elif variant_key == "slot_selection":
+            template_name = f"vera_{trg_kind}_slots_{variant}"
+        else:
+            template_name = f"vera_{trg_kind}_{variant}"
 
         identity = merchant.get("identity", {})
         owner = identity.get("owner_first_name") or identity.get("name", "them")
         merchant_name = identity.get("name") or "your business"
 
         template_params = [owner, merchant_name, raw_cta, body_text[:100]]
+
+        # If we have a matching template, render it with available params
+        rendered_body = None
+        if TEMPLATES:
+            # build param dict used by templates
+            params = {
+                "owner": owner,
+                "merchant_name": merchant_name,
+                "body": body_text,
+                "cta": raw_cta,
+                "anchor": result.get("template_params", [""])[0] if result.get("template_params") else "",
+                "offer_title": (result.get("template_params", [None, None])[1] or "").strip(),
+                "slot_name": (result.get("template_params", [None, None])[1] or "").strip(),
+                "slot1": (result.get("template_params", [None, None, None])[1] or "").strip(),
+                "slot2": (result.get("template_params", [None, None, None])[2] or "").strip(),
+                "customer": (result.get("template_params", [None])[0] or "").strip(),
+                "service": "",
+                "batch": (result.get("template_params", [None])[0] or "").strip(),
+                "trend": (result.get("template_params", [None])[0] or "").strip(),
+            }
+            try:
+                tpl = TEMPLATES.get(template_name)
+                if tpl:
+                    rendered_body = tpl.format(**params)
+            except Exception:
+                rendered_body = None
 
         action = {
             "conversation_id": conv_id,
@@ -436,7 +496,7 @@ async def tick(body: TickBody):
             "trigger_id": trg_id,
             "template_name": template_name,
             "template_params": template_params,
-            "body": body_text,
+            "body": rendered_body or body_text,
             "cta": raw_cta,
             "suppression_key": sup_key or f"{trg_kind}:{merchant_id}",
             "rationale": result.get("rationale", "Composed from 4-context framework"),

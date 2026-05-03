@@ -179,7 +179,8 @@ def _body_contains_fact(body: str, facts: Dict[str, Any]) -> bool:
     tokens = []
     for k, v in facts.items():
         try:
-            if isinstance(v, (int, float)) and v != 0:
+            # Skip zero/near-zero numeric facts as unreliable anchors
+            if isinstance(v, (int, float)) and abs(float(v)) > 0.000999:
                 tokens.append(str(v))
             elif isinstance(v, str):
                 # numbers inside strings
@@ -207,6 +208,16 @@ def _body_contains_fact(body: str, facts: Dict[str, Any]) -> bool:
         title = o.get("title", "")
         if title and title in body:
             return True
+    # fallback: check review themes and inventory signals
+    for theme in facts.get("review_themes", [])[:2]:
+        if isinstance(theme, str) and theme and theme in body:
+            return True
+    # Trigger payload may contain inventory or item names
+    payload = facts.get("trigger_payload", {}) or {}
+    if isinstance(payload, dict):
+        item = payload.get("item_name") or payload.get("offer_name") or payload.get("theme")
+        if item and item in body:
+            return True
     return False
 
 RATIONALE_TEMPLATE = (
@@ -214,6 +225,80 @@ RATIONALE_TEMPLATE = (
     "Merchant fact: {merchant_fact}. "
     "Lever: {lever_used}."
 )
+
+
+def _choose_best_anchor(facts: Dict[str, Any]) -> (str, list):
+    """Choose the best non-zero anchor from facts.
+    Prefer: active offer title > review theme > views/calls/ctr (if > tiny) > trigger_payload item.
+    Returns (anchor_text, [values...])
+    """
+    # Offers
+    offers = facts.get("active_offers", []) or []
+    if offers:
+        first = offers[0]
+        title = first.get("title")
+        if title:
+            return (f"Active offer: {title}", [title])
+
+    # Review themes
+    themes = facts.get("review_themes", []) or []
+    if themes:
+        t = themes[0]
+        if isinstance(t, str) and t:
+            return (f"Recent reviews mention '{t}'", [t])
+
+    # Numeric metrics (only if > tiny threshold)
+    views = facts.get("views_30d")
+    if isinstance(views, (int, float)) and views and int(views) > 0:
+        return (f"You had {int(views)} views in the last 30 days", [str(int(views))])
+
+    ctr = facts.get("ctr_30d")
+    try:
+        if isinstance(ctr, (int, float)) and abs(float(ctr)) > 0.000999:
+            # Format as percent if looks small
+            try:
+                # If value likely fraction (e.g., 0.048), show percent with 2 decimals
+                if abs(float(ctr)) < 1:
+                    pct = float(ctr) * 100.0
+                    return (f"Your CTR is {pct:.2f}%", [str(pct)])
+                return (f"Your CTR is {float(ctr)}%", [str(float(ctr))])
+            except Exception:
+                return (f"Your CTR: {ctr}", [str(ctr)])
+    except Exception:
+        pass
+
+    # Trigger payload item
+    payload = facts.get("trigger_payload", {}) or {}
+    item = payload.get("item_name") or payload.get("offer_name") or payload.get("theme")
+    if item:
+        return (f"Signal: {item}", [item])
+
+    return ("Quick opportunity from your recent signals", [])
+
+
+def _build_action_line(trigger_kind: str, facts: Dict[str, Any]) -> str:
+    """Return a short 1-line explicit action plan based on trigger_kind and available facts."""
+    anchor, vals = _choose_best_anchor(facts)
+    offer = vals[0] if vals else None
+    if trigger_kind in ("perf_dip", "perf_dip_severe"):
+        if offer:
+            return f"I'll activate '{offer}' and update your GBP post today if you reply YES."
+        return "I'll draft a concrete 1-line offer + GBP update and send it if you reply YES."
+    if trigger_kind in ("recall_due", "chronic_refill_due"):
+        return "I'll propose 2 slots and message the customer on your approval — reply with the slot number."
+    if trigger_kind == "active_planning_intent":
+        return "I'll start execution now: drafting the post and scheduling it — tell me any edits."
+    if trigger_kind == "perf_spike":
+        return "I'll draft a momentum post and schedule it in the next 2 hours if you reply YES."
+    if trigger_kind == "competitor_opened":
+        return "I'll prepare a quick counter-offer post and GBP highlight — reply YES to run it."
+    if trigger_kind == "renewal_due":
+        return "I'll send a renewal reminder draft for your review — reply YES to approve."
+    # Default action
+    if offer:
+        return f"I'll draft a short campaign using '{offer}' and send on approval."
+    return "I'll draft a ready-to-send message and send it once you reply YES."
+
 
 
 # ── Category voice profiles ────────────────────────────────────────────────
@@ -751,39 +836,18 @@ def compose(
         # Ensure specificity: body must contain at least one concrete fact from facts
         if not _body_contains_fact(body, facts):
             logger.warning(f"Composed body missing concrete fact for {trigger_kind}; applying deterministic template")
-            # deterministic, high-specificity template fallback
+            # deterministic, high-specificity template fallback using best available anchor
             owner = facts.get("owner_name") or merchant.get("identity", {}).get("owner_first_name", "")
-            mname = facts.get("merchant_name") or merchant.get("identity", {}).get("name", "your business")
-            ctr = facts.get("ctr_30d")
-            peer = facts.get("peer_avg_ctr")
-            views = facts.get("views_30d")
-            offer = ""
-            if facts.get("active_offers"):
-                ao = facts.get("active_offers")[0]
-                offer = ao.get("title", "")
-
-            parts = []
-            if ctr is not None:
-                try:
-                    parts.append(f"Your CTR is {ctr}%")
-                    if peer is not None:
-                        parts[-1] += f" vs peer {peer}%"
-                except Exception:
-                    pass
-            elif views is not None:
-                parts.append(f"You had {views} views in the last 30 days")
-            if offer:
-                parts.append(f"Active offer: {offer}")
-
-            why_now = "; ".join(parts) if parts else "Quick opportunity from your recent signals"
-            deterministic_body = f"{owner}, {why_now}. Want me to draft a message you can send? Reply YES to proceed."
+            anchor_text, anchor_vals = _choose_best_anchor(facts)
+            action_line = _build_action_line(trigger_kind, facts)
+            deterministic_body = f"{owner}, {anchor_text}. {action_line}"
             return {
                 "body": deterministic_body,
                 "cta": "binary_yes_stop",
                 "send_as": "merchant_on_behalf" if customer and trigger.get("scope") == "customer" else "vera",
-                "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id')}"),
-                "rationale": f"Deterministic fallback: ensured numeric anchor for {trigger_kind}",
-                "template_params": [str(ctr) if ctr is not None else "", str(peer) if peer is not None else "", offer]
+                "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id') }"),
+                "rationale": f"Deterministic fallback: ensured non-zero anchor for {trigger_kind}",
+                "template_params": anchor_vals
             }
 
         # Normalize CTA to judge expected values
@@ -800,12 +864,23 @@ def compose(
         send_as = result.get("send_as", "vera")
         if customer and trigger.get("scope") == "customer":
             send_as = "merchant_on_behalf"
-        
+        # Ensure there is a 1-line explicit action plan. If missing, append one.
+        action_phrase_re = re.compile(r"(I\s?(?:'ll|will|can|ll)|Reply\s+YES|Want me to|I'll|I will|I'll draft|I'll activate|I'll send|I'll start|I'll prepare)", re.I)
+        if not action_phrase_re.search(body):
+            action_line = _build_action_line(trigger_kind, facts)
+            # Append as final sentence (single short line)
+            if not body.endswith("."):
+                body = body + "."
+            body = body + " " + action_line
+            # If CTA was none, promote to binary to enable explicit approval
+            if cta == "none":
+                cta = "binary_yes_stop"
+
         return {
             "body": body,
             "cta": cta,
             "send_as": send_as,
-            "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id')}"),
+            "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id') }"),
             "rationale": result.get("rationale", f"Composed for {trigger_kind} trigger"),
             "template_params": result.get("template_params", [])
         }

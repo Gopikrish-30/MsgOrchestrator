@@ -1,0 +1,12 @@
+{
+  "vera_restaurant_binary_v2": "{owner}, your active offer \"{offer_title}\" isn't getting traction. I'll draft a short GBP post + 2-hour flash banner and schedule it if you reply YES.",
+  "vera_gyms_binary_v2": "Hey {owner}, morning class slots for \"{slot_name}\" are empty — I'll open 5 priority slots and send a 1-click booking message to past visitors if you reply YES.",
+  "vera_pharmacies_binary_v2": "Hi {owner}, batch {batch} for your stock is running low. I'll draft supplier outreach + a refill reminder message for affected customers — reply YES to proceed.",
+  "vera_salons_binary_v2": "Congrats {owner} — {trend}. I'll post a parent-facing boost and open a waitlist; reply YES and I'll schedule it in the next 2 hours.",
+  "vera_generic_binary_v1": "{owner}, {anchor}. I'll draft a ready-to-send message and schedule it when you reply YES.",
+  "vera_dentists_slots_v1": "{owner}, {customer} is due for a {service}. Available: {slot1} or {slot2}. Reply 1 for {slot1}, 2 for {slot2} and I’ll confirm the booking.",
+  "vera_dentists_slots_v2": "{owner}, {customer} is due for {service}. Slots: {slot1} / {slot2}. Reply with the slot number and I'll book it now.",
+  "vera_restaurant_binary_v1": "{owner}, quick idea: {anchor}. Reply YES and I'll draft a GBP post + limited-time banner to boost this offer.",
+  "vera_salons_binary_v1": "{owner}, noticed {anchor}. I'll prepare a short campaign and schedule it on approval — reply YES to proceed.",
+  "vera_generic_binary_v2": "{owner}, {anchor}. I'll draft a short campaign using this signal and send it once you reply YES."
+}
