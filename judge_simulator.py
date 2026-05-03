@@ -33,6 +33,9 @@ LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
 import os as _os
 if not LLM_API_KEY:
     LLM_API_KEY = _os.getenv("LLM_API_KEY") or _os.getenv("GROQ_API_KEY") or _os.getenv("OPENAI_API_KEY") or ""
+# Allow overriding provider/model via environment variables
+LLM_PROVIDER = _os.getenv("LLM_PROVIDER", os.getenv("LLM_PROVIDER") if 'os' in globals() else None) or globals().get('LLM_PROVIDER', None) or _os.getenv("LLM_PROVIDER") or "openai"
+LLM_MODEL = _os.getenv("LLM_MODEL") or globals().get('LLM_MODEL', '')
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
 LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
