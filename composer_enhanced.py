@@ -76,7 +76,7 @@ You are scored on 5 dimensions (0–10 each). Maximize all 5:
 3. MERCHANT FIT — Use owner's first name. Use their actual CTR. Use their active offers by name.
    Reference their conversation history. Use their specific locality.
 
-4. TRIGGER RELEVANCE — The message must answer "why NOW". Name the trigger fact explicitly.
+4. TRIGGER RELEVANCE — The message must answer "why NOW" in the FIRST sentence. Name the trigger fact explicitly.
    Not "you should improve your profile" — "Your CTR is 2.1% vs peer 3.0% and your last GBP
    post was 22 days ago — these two are connected."
 
@@ -96,7 +96,7 @@ HARD RULES (breaking any = instant penalty):
 - Hindi-English code-mix when merchant languages include "hi" (natural, not forced)
 - No repetition of messages already in conversation_history
 
-OUTPUT: JSON only, no markdown fences:
+OUTPUT: JSON only, no markdown fences. FIRST sentence must be a short "Why now" that references a concrete numeric fact from FACTS PROVIDED:
 {
   "body": "the WhatsApp message body",
   "cta": "open_ended | binary_yes_stop | none",
@@ -104,6 +104,7 @@ OUTPUT: JSON only, no markdown fences:
   "rationale": "Trigger used: [X]. Merchant fact anchored: [Y]. Lever deployed: [Z].",
   "template_params": ["param1", "param2", "param3"]
 }"""
+
 
 
 # Trigger-kind specific instructions (append these based on trigger['kind'])
@@ -168,6 +169,45 @@ DEFAULT_TRIGGER_INSTRUCTION = (
     "Lead with the specific trigger fact. Connect to merchant context. "
     "Offer a specific next step. Single CTA."
 )
+
+
+def _body_contains_fact(body: str, facts: Dict[str, Any]) -> bool:
+    """Return True if body mentions at least one concrete numeric or offer fact from facts."""
+    if not body:
+        return False
+    # Collect numeric tokens from facts
+    tokens = []
+    for k, v in facts.items():
+        try:
+            if isinstance(v, (int, float)) and v != 0:
+                tokens.append(str(v))
+            elif isinstance(v, str):
+                # numbers inside strings
+                nums = re.findall(r"\d+(?:\.\d+)?", v)
+                tokens.extend(nums)
+            elif isinstance(v, (list, dict)):
+                s = json.dumps(v, ensure_ascii=False)
+                nums = re.findall(r"\d+(?:\.\d+)?", s)
+                tokens.extend(nums)
+        except Exception:
+            continue
+    # Also include key numeric facts with percent formatting
+    percent_keys = ["ctr_30d", "views_30d", "calls_30d", "leads_30d", "peer_avg_ctr"]
+    for k in percent_keys:
+        if k in facts:
+            v = facts.get(k)
+            if isinstance(v, (int, float)) and v != 0:
+                tokens.append(str(v))
+
+    for t in tokens:
+        if t and t in body:
+            return True
+    # fallback: check for offer titles
+    for o in facts.get("active_offers", [])[:2]:
+        title = o.get("title", "")
+        if title and title in body:
+            return True
+    return False
 
 RATIONALE_TEMPLATE = (
     "Trigger: {trigger_kind} ({trigger_fact}). "
@@ -708,12 +748,52 @@ def compose(
             logger.warning(f"Empty body for {trigger_kind}")
             return _fallback_response(trigger_kind, facts, merchant)
 
+        # Ensure specificity: body must contain at least one concrete fact from facts
+        if not _body_contains_fact(body, facts):
+            logger.warning(f"Composed body missing concrete fact for {trigger_kind}; applying deterministic template")
+            # deterministic, high-specificity template fallback
+            owner = facts.get("owner_name") or merchant.get("identity", {}).get("owner_first_name", "")
+            mname = facts.get("merchant_name") or merchant.get("identity", {}).get("name", "your business")
+            ctr = facts.get("ctr_30d")
+            peer = facts.get("peer_avg_ctr")
+            views = facts.get("views_30d")
+            offer = ""
+            if facts.get("active_offers"):
+                ao = facts.get("active_offers")[0]
+                offer = ao.get("title", "")
+
+            parts = []
+            if ctr is not None:
+                try:
+                    parts.append(f"Your CTR is {ctr}%")
+                    if peer is not None:
+                        parts[-1] += f" vs peer {peer}%"
+                except Exception:
+                    pass
+            elif views is not None:
+                parts.append(f"You had {views} views in the last 30 days")
+            if offer:
+                parts.append(f"Active offer: {offer}")
+
+            why_now = "; ".join(parts) if parts else "Quick opportunity from your recent signals"
+            deterministic_body = f"{owner}, {why_now}. Want me to draft a message you can send? Reply YES to proceed."
+            return {
+                "body": deterministic_body,
+                "cta": "binary_yes_stop",
+                "send_as": "merchant_on_behalf" if customer and trigger.get("scope") == "customer" else "vera",
+                "suppression_key": trigger.get("suppression_key", f"{trigger_kind}:{merchant.get('merchant_id')}"),
+                "rationale": f"Deterministic fallback: ensured numeric anchor for {trigger_kind}",
+                "template_params": [str(ctr) if ctr is not None else "", str(peer) if peer is not None else "", offer]
+            }
+
         # Normalize CTA to judge expected values
         raw_cta = result.get("cta", "open_ended")
         if raw_cta in ["binary_yes_stop", "binary", "yes_no", "confirmation"]:
             cta = "binary_yes_stop"
         elif raw_cta in ["open_ended", "open", "continue"]:
             cta = "open_ended"
+        elif raw_cta in ["slot_selection", "slots", "multi_choice"]:
+            cta = "slot_selection"
         else:
             cta = "none"
 
