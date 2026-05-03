@@ -266,7 +266,7 @@ async def tick(body: TickBody):
     actions = []
     now_str = body.now
 
-    # Score triggers by urgency, process highest priority first
+    # Score triggers by composite heuristic: urgency + offer value + recent deltas
     scored_triggers = []
     for trg_id in body.available_triggers:
         # Load trigger from store
@@ -283,10 +283,47 @@ async def tick(body: TickBody):
             logger.info(f"Skipping suppressed trigger: {trg_id}")
             continue
 
-        urgency = trg_payload.get("urgency", 0)
-        scored_triggers.append((urgency, trg_id, trg_payload))
+        # Base urgency
+        urgency = float(trg_payload.get("urgency", 0) or 0)
 
-    # Sort highest urgency first
+        # Merchant-level signals: prefer triggers with active offers, large recent deltas
+        merchant_id = trg_payload.get("merchant_id")
+        merchant_obj = None
+        try:
+            if merchant_id:
+                merchant_obj = context_store.get_merchant(merchant_id) or context_store.get("merchant", merchant_id)
+        except Exception:
+            merchant_obj = None
+
+        offer_count = 0
+        ctr_delta_pct = 0.0
+        merchant_ctr = 0.0
+        peer_ctr = 0.0
+        views_30d = 0
+        if merchant_obj:
+            offers = merchant_obj.get("offers") or merchant_obj.get("active_offers") or merchant_obj.get("offers", [])
+            # support both list-of-offers or 'active_offers'
+            if isinstance(offers, list):
+                offer_count = len([o for o in offers if (isinstance(o, dict) and (o.get("status") in ("active", None)) ) or (isinstance(o, dict) and o.get("title"))])
+            perf = merchant_obj.get("performance", {}) or {}
+            delta = perf.get("delta_7d", {}) or {}
+            ctr_delta_pct = float(delta.get("ctr_pct", 0) or 0) * 100.0
+            merchant_ctr = float(perf.get("ctr", 0) or 0)
+            views_30d = int(perf.get("views", 0) or 0)
+            peer = (merchant_obj.get("category_peer_stats") or {}).get("avg_ctr") or (merchant_obj.get("peer_avg_ctr") or 0)
+            try:
+                peer_ctr = float(peer or 0)
+            except Exception:
+                peer_ctr = 0.0
+
+        # Compose heuristic score (higher = better)
+        # Weights: urgency * 10, offers * 12, abs(ctr_delta)*8, peer_gap *6, views scale *0.01
+        peer_gap = max(0.0, peer_ctr - merchant_ctr)
+        score = urgency * 10.0 + min(offer_count, 3) * 12.0 + abs(ctr_delta_pct) * 8.0 + peer_gap * 6.0 + (views_30d * 0.01)
+
+        scored_triggers.append((score, trg_id, trg_payload))
+
+    # Sort highest score first
     scored_triggers.sort(key=lambda x: x[0], reverse=True)
 
     for urgency, trg_id, trg_payload in scored_triggers:
@@ -376,14 +413,20 @@ async def tick(body: TickBody):
         if customer_id and trigger.get("scope") == "customer":
             send_as = "merchant_on_behalf"
 
-        # Build action
+        # Build template_name based on CTA and trigger kind to provide richer templates
+        raw_cta = result.get("cta", "open_ended")
+        if raw_cta == "binary_yes_stop":
+            template_name = f"vera_{trg_kind}_binary_v1"
+        elif raw_cta == "slot_selection":
+            template_name = f"vera_{trg_kind}_slots_v1"
+        else:
+            template_name = f"vera_{trg_kind}_v1"
+
         identity = merchant.get("identity", {})
         owner = identity.get("owner_first_name") or identity.get("name", "them")
-        template_params = [
-            owner,
-            trg_kind,
-            body_text[:100],
-        ]
+        merchant_name = identity.get("name") or "your business"
+
+        template_params = [owner, merchant_name, raw_cta, body_text[:100]]
 
         action = {
             "conversation_id": conv_id,
@@ -391,10 +434,10 @@ async def tick(body: TickBody):
             "customer_id": customer_id or None,
             "send_as": send_as,
             "trigger_id": trg_id,
-            "template_name": f"vera_{trg_kind}_v1",
+            "template_name": template_name,
             "template_params": template_params,
             "body": body_text,
-            "cta": result.get("cta", "open_ended"),
+            "cta": raw_cta,
             "suppression_key": sup_key or f"{trg_kind}:{merchant_id}",
             "rationale": result.get("rationale", "Composed from 4-context framework"),
         }
